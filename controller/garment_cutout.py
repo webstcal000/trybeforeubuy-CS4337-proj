@@ -46,13 +46,21 @@ def _clean(mask):
     return out
 
 
-def plain_background(image, max_std=12.0):
-    """Background colour if the photo is a product shot on a plain backdrop, else None."""
-    border = np.vstack([image[:3].reshape(-1, 3), image[-3:].reshape(-1, 3),
-                        image[:, :3].reshape(-1, 3), image[:, -3:].reshape(-1, 3)]).astype(np.float32)
-    if border.std(axis=0).max() > max_std:
-        return None
-    return np.median(border, axis=0)
+def plain_background(image, min_share=0.7, tolerance=12):
+    """Background colour if the photo is a product shot on a plain backdrop, else None.
+
+    Uses the dominant border colour, so a thin frame line or a cropped sleeve
+    touching the edge doesn't disqualify an otherwise plain backdrop.
+    """
+    border = np.vstack([image[:4].reshape(-1, 3), image[-4:].reshape(-1, 3),
+                        image[:, :4].reshape(-1, 3), image[:, -4:].reshape(-1, 3)]).astype(np.float32)
+    bins = (border // 16).astype(np.int32)
+    keys = bins[:, 0] * 256 + bins[:, 1] * 16 + bins[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    top = values[np.argmax(counts)]
+    candidate = np.median(border[keys == top], axis=0)
+    close = np.abs(border - candidate).max(axis=1) <= tolerance
+    return candidate if close.mean() >= min_share else None
 
 
 def _cut_from_backdrop(image, bg, tolerance=14):

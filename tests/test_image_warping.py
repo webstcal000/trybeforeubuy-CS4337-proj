@@ -168,6 +168,7 @@ def test_cutout_light_shirt_on_white_product_shot():
     image, truth, lm = make_tshirt()
     image[:] = 250
     image[truth > 0] = 205                       # light grey shirt on white, like garment 265
+    image[-3:] = 0                               # thin black frame line at the bottom, also like 265
     mask = cut_out_garment(image, (30, 35, 210, 265), lm, clothes_type=1)
     inter = ((mask > 0) & (truth > 0)).sum()
     union = ((mask > 0) | (truth > 0)).sum()
