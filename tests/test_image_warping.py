@@ -78,8 +78,16 @@ def test_correspondences_respect_left_right_conventions():
     assert d["collar_l"][0] < 300 < d["collar_r"][0]
     assert d["hem_l"][0] < 300 < d["hem_r"][0]
     assert d["collar_l"][1] < d["hem_l"][1]
-    # No elbows/wrists -> sleeves are left out.
-    assert "sleeve_l" not in names
+    # No elbows/wrists -> sleeves keep the garment's own proportions.
+    assert d["sleeve_l"][0] < d["collar_l"][0] and d["sleeve_r"][0] > d["collar_r"][0]
+
+
+def test_garment_is_sized_to_the_torso():
+    warper = GarmentWarper(method="tps")
+    _, mask = warper.warp(make_garment(), body_keypoints(), (600, 600, 3))
+    # Shirt body (below the sleeves) should be about as wide as the torso: 0.92 * 160 px.
+    row = np.nonzero(mask[300] > 127)[0]
+    assert 120 < row.max() - row.min() < 175
 
 
 @pytest.mark.parametrize("method,tol", [("affine", 25.0), ("perspective", 1.0), ("tps", 2.0)])
