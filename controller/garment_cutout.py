@@ -46,12 +46,40 @@ def _clean(mask):
     return out
 
 
+def padding_mask(image, max_std=3.0):
+    """True for solid letterbox bars (whole rows/columns of one colour) along the edges."""
+    h, w = image.shape[:2]
+    pad = np.zeros((h, w), bool)
+    flat_rows = image.reshape(h, -1, 3).std(axis=1).max(axis=1) <= max_std
+    flat_cols = image.transpose(1, 0, 2).std(axis=1).max(axis=1) <= max_std
+    for flat, n, set_line in ((flat_rows, h, lambda i: pad.__setitem__(i, True)),
+                              (flat_cols, w, lambda i: pad.__setitem__((slice(None), i), True))):
+        i = 0
+        while i < n and flat[i]:
+            set_line(i); i += 1
+        i = n - 1
+        while i >= 0 and flat[i]:
+            set_line(i); i -= 1
+    return pad
+
+
+def _strip_padding(image):
+    """Image cropped to inside any letterbox bars, plus the crop offsets."""
+    pad = padding_mask(image)
+    rows = np.where(~pad.all(axis=1))[0]
+    cols = np.where(~pad.all(axis=0))[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return image, 0, 0
+    return image[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1], rows[0], cols[0]
+
+
 def plain_background(image, min_share=0.7, tolerance=12):
     """Background colour if the photo is a product shot on a plain backdrop, else None.
 
     Uses the dominant border colour, so a thin frame line or a cropped sleeve
     touching the edge doesn't disqualify an otherwise plain backdrop.
     """
+    image, _, _ = _strip_padding(image)
     border = np.vstack([image[:4].reshape(-1, 3), image[-4:].reshape(-1, 3),
                         image[:, :4].reshape(-1, 3), image[:, -4:].reshape(-1, 3)]).astype(np.float32)
     bins = (border // 16).astype(np.int32)
@@ -65,6 +93,7 @@ def plain_background(image, min_share=0.7, tolerance=12):
 
 def _cut_from_backdrop(image, bg, tolerance=14):
     diff = np.abs(image.astype(np.float32) - bg[None, None]).max(axis=2)
+    diff[padding_mask(image)] = 0
     mask = (diff > tolerance).astype(np.uint8) * 255
     return _clean(mask)
 
