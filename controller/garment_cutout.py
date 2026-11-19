@@ -68,6 +68,11 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
         cut = int(min(tops))
         region = gc[:max(cut, 0)]
         region[region == cv2.GC_PR_FGD] = cv2.GC_PR_BGD
+        # Well above the collar is never garment. Without this GrabCut keeps the
+        # white backdrop of light-coloured product shots attached to the shoulders.
+        hard = int(cut - 0.06 * (y2 - y1))
+        if hard > 0:
+            gc[:hard] = cv2.GC_BGD
 
     box = gc == cv2.GC_PR_FGD
     gc[box & (skin_mask(image) > 0)] = cv2.GC_PR_BGD
