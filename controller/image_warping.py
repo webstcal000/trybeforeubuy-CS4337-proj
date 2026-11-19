@@ -139,6 +139,11 @@ class GarmentWarper:
         pairs = []
         if clothes_type in (1, 3):
             span = np.linalg.norm(sh["r"] - sh["l"])
+            if hip["l"] is not None and hip["r"] is not None:
+                torso = np.linalg.norm((hip["l"] + hip["r"]) / 2 - (sh["l"] + sh["r"]) / 2)
+                if span < 10 or torso < 10 or span < 0.25 * torso:
+                    raise ValueError("shoulder keypoints are too close together to be right "
+                                     f"({span:.0f}px apart); pose detection probably failed")
             u = (sh["r"] - sh["l"]) / max(span, 1e-6)          # across the body, image-left -> right
             n = np.array([-u[1], u[0]])                        # down the body
             sh_mid = (sh["l"] + sh["r"]) / 2

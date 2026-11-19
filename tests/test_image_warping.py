@@ -124,6 +124,14 @@ def test_missing_shoulders_raise():
         GarmentWarper().compute_correspondences(lm, kp)
 
 
+def test_collapsed_keypoints_raise():
+    _, _, lm = make_tshirt()
+    kp = {"right_shoulder": (305, 137), "left_shoulder": (311, 137),
+          "right_hip": (305, 143), "left_hip": (311, 143)}
+    with pytest.raises(ValueError):
+        GarmentWarper().compute_correspondences(lm, kp)
+
+
 def test_lower_body_garment_uses_hips():
     lm = {"waist_l": (60, 20), "waist_r": (140, 20), "hem_l": (50, 280), "hem_r": (150, 280)}
     src, dst, names = GarmentWarper().compute_correspondences(lm, body_keypoints(), clothes_type=2)
