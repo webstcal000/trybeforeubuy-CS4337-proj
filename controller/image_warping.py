@@ -182,7 +182,7 @@ class GarmentWarper:
             body_width = 0.92 * span          # shoulder-tip span is a bit wider than the torso
             scale = body_width / max(g_width, 1e-6)
 
-            anchor = along(-0.06 * span)      # base of the neck
+            anchor = along(0.0)               # neckline sits on the shoulder line
             for name, p in g.items():
                 rel = p - g_collar
                 target = anchor + scale * (u * np.dot(rel, g_u) + n * np.dot(rel, g_n))
@@ -397,29 +397,48 @@ class GarmentWarper:
 
     @staticmethod
     def _arm_mask(body_image, body_mask, keypoints):
-        """Bare-skin pixels on the person outside the central torso (i.e. arms), as 0/1 float."""
-        from controller.garment_cutout import skin_mask
+        """Bare-arm pixels beside the torso, as 0/1 float.
+
+        Skin is defined by the person's own face colour (sampled between the top of
+        the head and the neck), so beige or tan clothing isn't mistaken for arms.
+        """
         sh = {s: _body_point(keypoints, s, "shoulder") for s in "lr"}
         hip = {s: _body_point(keypoints, s, "hip") for s in "lr"}
-        if any(v is None for v in (sh["l"], sh["r"], hip["l"], hip["r"])):
+        head, neck = keypoints.get("head_top"), keypoints.get("neck")
+        if any(v is None for v in (sh["l"], sh["r"], hip["l"], hip["r"], head, neck)):
             return None
+        h, w = body_image.shape[:2]
+        lab = cv2.cvtColor(body_image, cv2.COLOR_BGR2LAB).astype(np.float32)
         span = np.linalg.norm(sh["r"] - sh["l"])
+        cx = int(neck[0])
+        y0, y1 = int(head[1] + 0.45 * (neck[1] - head[1])), int(neck[1])
+        x0, x1 = max(cx - int(0.12 * span), 0), min(cx + int(0.12 * span), w)
+        face = lab[max(y0, 0):max(y1, 0), x0:x1].reshape(-1, 3)
+        if len(face) < 30:
+            return None
+        ref = np.median(face, axis=0)
+        # Distance in a/b (colour) with a looser limit on L (brightness changes along the arm).
+        dab = np.linalg.norm(lab[..., 1:] - ref[1:], axis=2)
+        skin = (dab < 9) & (np.abs(lab[..., 0] - ref[0]) < 60)
+
         u = (sh["r"] - sh["l"]) / max(span, 1e-6)
         inset = 0.12 * span
         core = np.array([sh["l"] + u * inset, sh["r"] - u * inset,
                          hip["r"] - u * 0.5 * inset, hip["l"] + u * 0.5 * inset], np.int32)
-        torso = np.zeros(body_image.shape[:2], np.uint8)
+        torso = np.zeros((h, w), np.uint8)
         cv2.fillPoly(torso, [core], 255)
-        skin = skin_mask(body_image) > 0
         if body_mask is not None:
             skin &= body_mask > 0
         skin &= torso == 0
-        top = int(min(sh["l"][1], sh["r"][1]))
-        skin[:top] = False                      # neck and face are handled by the collar
-        k = max(3, (body_image.shape[0] // 120) | 1)
+        skin[:int(min(sh["l"][1], sh["r"][1]))] = False
+        k = max(3, (h // 100) | 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         arms = cv2.morphologyEx(skin.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel)
-        return (arms > 0).astype(np.float32)
+        # Keep only sizeable blobs (real arms), not scattered matches.
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(arms)
+        keep = np.zeros(n, bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] > 0.002 * h * w
+        return keep[lbl].astype(np.float32)
 
     def try_on(self, body_image, segmentation, garment, method=None):
         """Convenience: warp + blend using BodySegmenter.run() output."""

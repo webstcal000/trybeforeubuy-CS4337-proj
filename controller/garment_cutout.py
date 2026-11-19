@@ -46,9 +46,32 @@ def _clean(mask):
     return out
 
 
+def plain_background(image, max_std=12.0):
+    """Background colour if the photo is a product shot on a plain backdrop, else None."""
+    border = np.vstack([image[:3].reshape(-1, 3), image[-3:].reshape(-1, 3),
+                        image[:, :3].reshape(-1, 3), image[:, -3:].reshape(-1, 3)]).astype(np.float32)
+    if border.std(axis=0).max() > max_std:
+        return None
+    return np.median(border, axis=0)
+
+
+def _cut_from_backdrop(image, bg, tolerance=14):
+    diff = np.abs(image.astype(np.float32) - bg[None, None]).max(axis=2)
+    mask = (diff > tolerance).astype(np.uint8) * 255
+    return _clean(mask)
+
+
 def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations=5):
     """Return a uint8 mask (255 = garment) the same size as ``image``."""
     h, w = image.shape[:2]
+    bg = plain_background(image)
+    if bg is not None:
+        # Flat product shot: whatever isn't backdrop is the garment. More reliable
+        # than GrabCut for light garments on white.
+        mask = _cut_from_backdrop(image, bg)
+        skin_share = (skin_mask(image)[mask > 0] > 0).mean() if mask.any() else 1.0
+        if mask.mean() > 255 * 0.05 and skin_share < 0.03:
+            return mask   # no person in the photo: a flat product shot
     landmarks = landmarks or {}
     gc = np.full((h, w), cv2.GC_BGD, np.uint8)
 
@@ -76,6 +99,10 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
 
     box = gc == cv2.GC_PR_FGD
     gc[box & (skin_mask(image) > 0)] = cv2.GC_PR_BGD
+    if bg is not None:
+        # Model photographed on a plain backdrop: the backdrop is certainly not garment.
+        diff = np.abs(image.astype(np.float32) - bg[None, None]).max(axis=2)
+        gc[diff <= 8] = cv2.GC_BGD
 
     core = _core_polygon(landmarks, clothes_type)
     if core is not None:

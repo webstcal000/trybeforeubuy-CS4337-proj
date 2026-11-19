@@ -162,3 +162,30 @@ def test_cutout_finds_shirt_and_drops_skin():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_cutout_light_shirt_on_white_product_shot():
+    image, truth, lm = make_tshirt()
+    image[:] = 250
+    image[truth > 0] = 205                       # light grey shirt on white, like garment 265
+    mask = cut_out_garment(image, (30, 35, 210, 265), lm, clothes_type=1)
+    inter = ((mask > 0) & (truth > 0)).sum()
+    union = ((mask > 0) | (truth > 0)).sum()
+    assert inter / union > 0.95
+
+
+def test_beige_clothing_is_not_treated_as_arms():
+    h, w = 600, 600
+    body = np.full((h, w, 3), 200, np.uint8)
+    face = (140, 170, 225)                       # BGR skin tone
+    beige = (150, 190, 200)                      # beige hoodie
+    cv2.circle(body, (300, 80), 40, face, -1)
+    cv2.rectangle(body, (180, 150), (420, 420), beige, -1)
+    cv2.rectangle(body, (150, 160), (180, 380), face, -1)   # bare arm on the image left
+    body_mask = np.zeros((h, w), np.uint8)
+    cv2.rectangle(body_mask, (140, 40), (440, 560), 255, -1)
+    kp = body_keypoints()
+    kp.update({"head_top": (300, 40), "neck": (300, 130)})
+    arms = GarmentWarper._arm_mask(body, body_mask, kp)
+    assert arms[300, 165] == 1                   # the bare arm is found
+    assert arms[300, 200] == 0                   # the beige hoodie is not
