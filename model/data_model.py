@@ -24,19 +24,51 @@ class UserImage:
 
 
 class Garment:
-    """A single clothing item and its attributes."""
+    """A single clothing item and its attributes.
 
-    def __init__(self, garment_id, image_path, category, attributes):
-        pass
+    DeepFashion garments are photos of people wearing the clothes, so get_mask()
+    cuts the garment out of the photo using its bounding box and landmarks.
+    Landmark names use IMAGE left/right (see model/deepfashion.py).
+    """
+
+    def __init__(self, garment_id, image_path, category, attributes,
+                 clothes_type=1, bbox=None, landmarks=None, visibility=None,
+                 loader=None, mask=None):
+        self.garment_id = garment_id
+        self.image_path = image_path
+        self.category = category
+        self.attributes = attributes or {}
+        self.clothes_type = clothes_type        # 1 upper, 2 lower, 3 full body
+        self.bbox = bbox                        # (x1, y1, x2, y2) or None
+        self.landmarks = dict(landmarks or {})  # {name: (x, y)}
+        self.visibility = dict(visibility or {})
+        self._loader = loader                   # callable(image_path) -> BGR image
+        self.image = None
+        self.mask = mask
 
     def load(self):
-        pass
+        if self.image is None:
+            if self._loader is not None:
+                self.image = self._loader(self.image_path)
+            else:
+                import cv2
+                self.image = cv2.imread(self.image_path)
+            if self.image is None:
+                raise ValueError(f"could not read garment image {self.image_path}")
+        return self.image
 
     def get_mask(self):
-        pass
+        if self.mask is None:
+            from controller.garment_cutout import cut_out_garment
+            self.mask = cut_out_garment(self.load(), self.bbox, self.get_landmarks(),
+                                        self.clothes_type)
+        return self.mask
 
-    def get_landmarks(self):
-        pass
+    def get_landmarks(self, visible_only=True):
+        """Landmarks as {name: (x, y)}; occluded/cut-off ones dropped by default."""
+        if not visible_only:
+            return dict(self.landmarks)
+        return {k: p for k, p in self.landmarks.items() if self.visibility.get(k, 0) == 0}
 
 
 class DataModel:
