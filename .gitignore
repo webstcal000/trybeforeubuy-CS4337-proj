@@ -12,6 +12,9 @@ build/
 develop-eggs/
 dist/
 downloads/
+node_modules/
+frontend/dist/
+/PRD.md
 eggs/
 .eggs/
 lib/
