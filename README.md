@@ -63,6 +63,7 @@ npm run dev
 ```
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The Vite development server proxies `/api` requests to `http://127.0.0.1:8000`.
+Use **Help** in the studio header for the in-app walkthrough, photo tips, and preview limitations.
 
 The API starts even when local assets are missing. Check readiness at [http://127.0.0.1:8000/api/health](http://127.0.0.1:8000/api/health). The response distinguishes dataset/catalog readiness from sample-photo availability; without a dataset, the wardrobe and live try-on are unavailable rather than replaced with fake results.
 

@@ -63,11 +63,111 @@ function PersonPlaceholder({ onUpload, disabled }) {
   );
 }
 
+function HelpPage() {
+  const steps = [
+    {
+      number: "01",
+      title: "Start with a photo",
+      description: "Use the sample, or upload a JPEG or PNG up to 10 MB. Your original stays in the preview.",
+    },
+    {
+      number: "02",
+      title: "Choose one piece",
+      description: "Browse the edit or filter by category. Select a garment to make it your current choice.",
+    },
+    {
+      number: "03",
+      title: "Create your preview",
+      description: "Choose “Try it on” and give the local image pipeline a moment to process your photo.",
+    },
+    {
+      number: "04",
+      title: "Compare and save",
+      description: "Switch between Before and After, then download the generated PNG. Changing the photo or garment clears the old result.",
+    },
+  ];
+
+  return (
+    <article id="help" className="help-page" aria-labelledby="help-title">
+      <header className="help-intro">
+        <p className="eyebrow">A quick guide</p>
+        <h1 id="help-title">Your fitting room, <em>step by step.</em></h1>
+        <p>
+          Try a look for inspiration. Pick a photo, choose a piece, and make a
+          preview — all right here in the studio.
+        </p>
+        <a className="button button--dark" href="#studio">
+          Back to the studio <Icon name="arrow" size={16} />
+        </a>
+      </header>
+
+      <section className="help-steps" aria-labelledby="help-steps-title">
+        <div className="help-section-heading">
+          <div>
+            <p className="eyebrow">The simple version</p>
+            <h2 id="help-steps-title">From photo to preview</h2>
+          </div>
+          <span className="help-section-heading__aside">FOUR SMALL STEPS</span>
+        </div>
+        <div className="help-step-grid">
+          {steps.map((step) => (
+            <section className="help-step panel" key={step.number}>
+              <span className="help-step__number">{step.number}</span>
+              <h3>{step.title}</h3>
+              <p>{step.description}</p>
+            </section>
+          ))}
+        </div>
+      </section>
+
+      <section className="help-details" aria-label="Photo tips and important details">
+        <div className="help-detail panel">
+          <p className="eyebrow">A few photo tips</p>
+          <h2>Make it easy to see you.</h2>
+          <ul>
+            <li>Include one person, facing the camera.</li>
+            <li>Choose even lighting and keep the shoulders and garment area visible.</li>
+            <li>Stand naturally; avoid objects or crossed arms covering the area.</li>
+          </ul>
+          <p className="help-detail__fine">Clear, well-lit photos usually give the pipeline more to work with.</p>
+        </div>
+        <div className="help-detail help-detail--tint panel">
+          <p className="eyebrow">A note on previews</p>
+          <h2>Made for inspiration.</h2>
+          <p>
+            The result is a visual styling preview, not a sizing recommendation
+            or a guarantee of how a garment will fit.
+          </p>
+          <p className="help-detail__fine">
+            Your photo is processed by the local app and is not intentionally saved.
+          </p>
+        </div>
+      </section>
+
+      <aside className="help-setup" aria-labelledby="help-setup-title">
+        <div>
+          <p className="eyebrow">Need a hand?</p>
+          <h2 id="help-setup-title">If the wardrobe is empty</h2>
+          <p>
+            The local DeepFashion dataset must be installed for garments to
+            appear. Check that its annotations and images are in <code>downloads/</code>,
+            then refresh the studio.
+          </p>
+        </div>
+        <a className="text-button" href="#studio">
+          Return to studio <Icon name="arrow" size={15} />
+        </a>
+      </aside>
+    </article>
+  );
+}
+
 function App() {
   const fileInputRef = useRef(null);
   const photoRef = useRef(null);
   const resultRef = useRef(null);
   const objectUrlsRef = useRef(new Set());
+  const [page, setPage] = useState(() => window.location.hash === "#help" ? "help" : "studio");
   const [health, setHealth] = useState(null);
   const [garments, setGarments] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -114,6 +214,12 @@ function App() {
     resultRef.current = nextResult;
     setResult(nextResult);
   }, [releaseUrl]);
+
+  useEffect(() => {
+    const syncPage = () => setPage(window.location.hash === "#help" ? "help" : "studio");
+    window.addEventListener("hashchange", syncPage);
+    return () => window.removeEventListener("hashchange", syncPage);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -257,19 +363,28 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <a className="wordmark" href="/" aria-label="TryBeforeUBuy studio">
+        <a className="wordmark" href="#studio" aria-label="TryBeforeUBuy studio">
          {/* <span className="wordmark__symbol">t<span>b</span></span> */}
           <span>TryBeforeUBuy</span>
         </a>
+        <nav className="topbar__nav" aria-label="Main navigation">
+          <a href="#studio" aria-current={page === "studio" ? "page" : undefined}>Studio</a>
+          <a href="#help" aria-current={page === "help" ? "page" : undefined}>Help</a>
+        </nav>
         <div className="topbar__right">
           <span className="topbar__edition">THE VIRTUAL FITTING ROOM</span>
           <span className={`service-indicator ${health?.pipeline_ready ? "is-ready" : ""}`}>
             <span aria-hidden="true" />
-            {health?.pipeline_ready ? "Studio ready" : "Needs setup"}
+            <span className="service-indicator__text">{health?.pipeline_ready ? "Studio ready" : "Needs setup"}</span>
+            <span className="service-indicator__compact" aria-hidden="true">{health?.pipeline_ready ? "Ready" : "Setup"}</span>
           </span>
         </div>
       </header>
 
+      {page === "help" ? (
+        <HelpPage />
+      ) : (
+        <>
       <section className="intro" aria-labelledby="page-title">
         <div>
           <p className="eyebrow">A space to explore</p>
@@ -294,7 +409,7 @@ function App() {
         </div>
       )}
 
-      <section className="studio" aria-label="Virtual styling studio">
+      <section id="studio" className="studio" aria-label="Virtual styling studio">
         <section className="preview-panel panel" aria-labelledby="preview-title">
           <div className="panel-heading">
             <div>
@@ -488,10 +603,13 @@ function App() {
           )}
         </aside>
       </section>
+        </>
+      )}
 
       <footer className="page-footer">
         <span>TRYBEFOREUBUY <span aria-hidden="true">·</span> A PERSONAL STYLE STUDIO</span>
         <span>Visual styling preview only — not a guarantee of fit.</span>
+        <span className="page-footer__credit">Built by Gerald, Caleb, and Summit</span>
       </footer>
     </main>
   );
