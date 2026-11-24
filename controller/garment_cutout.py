@@ -98,17 +98,46 @@ def _cut_from_backdrop(image, bg, tolerance=14):
     return _clean(mask)
 
 
+def product_shot_mask(image):
+    """Garment mask if the photo is a flat product shot (no person, plain backdrop), else None."""
+    bg = plain_background(image)
+    if bg is None:
+        return None
+    mask = _cut_from_backdrop(image, bg)
+    skin_share = (skin_mask(image)[mask > 0] > 0).mean() if mask.any() else 1.0
+    if mask.mean() > 255 * 0.05 and skin_share < 0.03:
+        return mask
+    return None
+
+
+def photo_kind(image):
+    """"product" for a flat product shot, "worn" when someone is wearing the garment."""
+    return "product" if product_shot_mask(image) is not None else "worn"
+
+
+def _below_hem(shape, landmarks, margin):
+    """Mask of everything below the line through the hem corners, pushed down by ``margin`` px."""
+    if "hem_l" not in landmarks or "hem_r" not in landmarks:
+        return None
+    h, w = shape[:2]
+    (x1, y1), (x2, y2) = landmarks["hem_l"], landmarks["hem_r"]
+    if abs(x2 - x1) < 1:
+        return None
+    slope = (y2 - y1) / (x2 - x1)
+    xs = np.arange(w)
+    line = y1 + slope * (xs - x1) + margin
+    return np.arange(h)[:, None] > line[None, :]
+
+
 def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations=5):
     """Return a uint8 mask (255 = garment) the same size as ``image``."""
     h, w = image.shape[:2]
-    bg = plain_background(image)
-    if bg is not None:
+    product = product_shot_mask(image)
+    if product is not None:
         # Flat product shot: whatever isn't backdrop is the garment. More reliable
         # than GrabCut for light garments on white.
-        mask = _cut_from_backdrop(image, bg)
-        skin_share = (skin_mask(image)[mask > 0] > 0).mean() if mask.any() else 1.0
-        if mask.mean() > 255 * 0.05 and skin_share < 0.03:
-            return mask   # no person in the photo: a flat product shot
+        return product
+    bg = plain_background(image)
     landmarks = landmarks or {}
     gc = np.full((h, w), cv2.GC_BGD, np.uint8)
 
@@ -141,6 +170,11 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
         diff = np.abs(image.astype(np.float32) - bg[None, None]).max(axis=2)
         gc[diff <= 8] = cv2.GC_BGD
 
+    # A worn garment ends at its hem: trousers and legs below it are background.
+    below = _below_hem((h, w), landmarks, 0.04 * (y2 - y1))
+    if below is not None:
+        gc[below] = cv2.GC_BGD
+
     core = _core_polygon(landmarks, clothes_type)
     if core is not None:
         cv2.fillPoly(gc, [core], cv2.GC_FGD)
@@ -156,3 +190,39 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
     cv2.grabCut(image, gc, None, bgd, fgd, iterations, cv2.GC_INIT_WITH_MASK)
     mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
     return _clean(mask)
+
+
+def garment_quality(image, mask, landmarks, clothes_type=1):
+    """(usable, reason) for a garment photo and its cut-out.
+
+    Catches the cases where the try-on can't look right whatever the warp does:
+    a cut-out that grabbed most of the photo or almost nothing, one that misses
+    the garment's own body, a light garment that blends into a light backdrop,
+    and side-on photos whose hem corners have collapsed together.
+    """
+    h, w = mask.shape[:2]
+    share = (mask > 0).mean()
+    if share > 0.6:
+        return False, "cut-out covers most of the photo"
+    if share < 0.03:
+        return False, "cut-out is almost empty"
+    names = CORE_POINTS.get(clothes_type, CORE_POINTS[1])
+    if all(n in landmarks for n in names):
+        quad = np.array([landmarks[n] for n in names], np.int32)
+        core = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(core, [quad], 1)
+        if core.any() and ((mask > 0) & (core > 0)).sum() / core.sum() < 0.6:
+            return False, "cut-out misses the garment"
+    bg = plain_background(image)
+    if bg is not None:
+        contrast = np.abs(image[mask > 0].astype(np.float32) - bg).max(axis=1).mean()
+        if contrast < 35:
+            return False, "garment blends into the background"
+    top = [landmarks[n] for n in names[:2] if n in landmarks]
+    bottom = [landmarks[n] for n in ("hem_l", "hem_r") if n in landmarks]
+    if len(top) == 2 and len(bottom) == 2:
+        length = abs((bottom[0][1] + bottom[1][1]) / 2 - (top[0][1] + top[1][1]) / 2)
+        hem = abs(bottom[1][0] - bottom[0][0])
+        if clothes_type == 1 and length > 0 and hem / length < 0.2:
+            return False, "photographed side-on"
+    return True, "ok"
