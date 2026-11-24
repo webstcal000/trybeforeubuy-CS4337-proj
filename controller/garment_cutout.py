@@ -190,3 +190,39 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
     cv2.grabCut(image, gc, None, bgd, fgd, iterations, cv2.GC_INIT_WITH_MASK)
     mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
     return _clean(mask)
+
+
+def garment_quality(image, mask, landmarks, clothes_type=1):
+    """(usable, reason) for a garment photo and its cut-out.
+
+    Catches the cases where the try-on can't look right whatever the warp does:
+    a cut-out that grabbed most of the photo or almost nothing, one that misses
+    the garment's own body, a light garment that blends into a light backdrop,
+    and side-on photos whose hem corners have collapsed together.
+    """
+    h, w = mask.shape[:2]
+    share = (mask > 0).mean()
+    if share > 0.6:
+        return False, "cut-out covers most of the photo"
+    if share < 0.03:
+        return False, "cut-out is almost empty"
+    names = CORE_POINTS.get(clothes_type, CORE_POINTS[1])
+    if all(n in landmarks for n in names):
+        quad = np.array([landmarks[n] for n in names], np.int32)
+        core = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(core, [quad], 1)
+        if core.any() and ((mask > 0) & (core > 0)).sum() / core.sum() < 0.6:
+            return False, "cut-out misses the garment"
+    bg = plain_background(image)
+    if bg is not None:
+        contrast = np.abs(image[mask > 0].astype(np.float32) - bg).max(axis=1).mean()
+        if contrast < 35:
+            return False, "garment blends into the background"
+    top = [landmarks[n] for n in names[:2] if n in landmarks]
+    bottom = [landmarks[n] for n in ("hem_l", "hem_r") if n in landmarks]
+    if len(top) == 2 and len(bottom) == 2:
+        length = abs((bottom[0][1] + bottom[1][1]) / 2 - (top[0][1] + top[1][1]) / 2)
+        hem = abs(bottom[1][0] - bottom[0][0])
+        if clothes_type == 1 and length > 0 and hem / length < 0.2:
+            return False, "photographed side-on"
+    return True, "ok"

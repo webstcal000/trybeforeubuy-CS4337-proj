@@ -67,6 +67,12 @@ class Garment:
                                         self.clothes_type)
         return self.mask
 
+    def check_usable(self):
+        """(usable, reason): whether this garment photo can give a sensible try-on."""
+        from controller.garment_cutout import garment_quality
+        return garment_quality(self.load(), self.get_mask(), self.get_landmarks(),
+                               self.clothes_type)
+
     def get_landmarks(self, visible_only=True):
         """Landmarks as {name: (x, y)}; occluded/cut-off ones dropped by default."""
         if not visible_only:

@@ -155,7 +155,7 @@ class GarmentWarper:
     """Aligns garment landmarks to body keypoints and blends the result."""
 
     def __init__(self, method="tps", feather=0.003, clip_margin=None, tps_regularization=1e-3,
-                 shading=0.6, keep_arms=True):
+                 shading=0.6, keep_arms="auto"):
         if method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}")
         self.method = method
@@ -163,7 +163,10 @@ class GarmentWarper:
         self.clip_margin = clip_margin          # how far past the body mask a garment may reach
         self.tps_regularization = tps_regularization
         self.shading = shading                  # 0 = flat garment, 1 = full lighting from the photo
-        self.keep_arms = keep_arms              # keep bare arms in front of the garment
+        # Keep bare arms in front of the garment. "auto": only when the pose has
+        # elbow keypoints, because without them the sleeves stay in the catalog
+        # model's pose and the wearer's arms show through as stripes.
+        self.keep_arms = keep_arms
         self.last = {}                          # details of the most recent warp, for evaluation
 
     # ---------------------------------------------------------- correspondences
@@ -238,8 +241,18 @@ class GarmentWarper:
             g_width = None if worn else self._garment_torso_width(garment_mask, g_collar, g_u, g_n, g_len)
             if g_width is None:
                 g_width = corners if corners else 3 * np.linalg.norm(g["collar_r"] - g["collar_l"])
+                if low:
+                    # Hem corners collapse when the model stands side-on or tucks
+                    # the shirt in; keep the width within believable proportions
+                    # of the garment's own length.
+                    lo, hi = (0.45, 0.9) if clothes_type == 1 else (0.25, 0.7)
+                    g_width = float(np.clip(g_width, lo * g_len, hi * g_len))
             body_width = 0.92 * span          # shoulder-tip span is a bit wider than the torso
             scale = body_width / max(g_width, 1e-6)
+            # Final safety net: the garment's length on the body must be believable
+            # (a top ends somewhere around the hips, not at the knees).
+            lo, hi = (0.7, 1.5) if clothes_type == 1 else (1.0, 2.6)
+            scale = float(np.clip(scale, lo * torso_len / g_len, hi * torso_len / g_len))
 
             anchor = along(0.0)               # neckline sits on the shoulder line
             for name, p in g.items():
@@ -437,13 +450,21 @@ class GarmentWarper:
         if protect_head and keypoints is not None:
             head = self._head_box(keypoints, (h, w))
             if head is not None:
+                # An ellipse rather than a box, so a high collar gets a rounded
+                # neckline instead of a square notch.
                 x0, y0, x1, y1 = head
-                alpha[y0:y1, x0:x1] = 0.0
+                keep = np.ones((h, w), np.float32)
+                cx, ry, rx = (x0 + x1) / 2, (y1 - y0), (x1 - x0) / 2
+                cv2.ellipse(keep, (int(cx), int(y0)), (int(rx), int(ry)), 0, 0, 360, 0.0, -1)
+                alpha *= keep
         if body_mask is not None and self.clip_margin is not None:
             r = max(1, int(self.clip_margin * h))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
             alpha *= cv2.dilate(body_mask, kernel) > 0
-        if self.keep_arms and keypoints is not None:
+        use_arms = self.keep_arms is True or (
+            self.keep_arms == "auto" and keypoints is not None
+            and (keypoints.get("left_elbow") is not None or keypoints.get("right_elbow") is not None))
+        if use_arms and keypoints is not None:
             arms = self._arm_mask(body_image, body_mask, keypoints)
             if arms is not None:
                 alpha *= 1.0 - arms

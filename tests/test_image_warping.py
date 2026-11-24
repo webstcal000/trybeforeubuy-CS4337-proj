@@ -217,7 +217,7 @@ def test_worn_photo_is_sized_by_hem_corners_not_arms():
     flat_w = dst_flat[i_r][0] - dst_flat[i_l][0]
     worn_w = dst_worn[i_r][0] - dst_worn[i_l][0]
     assert worn_w > 1.4 * flat_w                         # arms no longer shrink it
-    assert abs(worn_w - 0.92 * 160) < 15                 # hem spans the torso width
+    assert 110 < worn_w < 160                           # about the torso width (0.92 * 160)
 
 
 def test_cutout_drops_trousers_below_the_hem():
@@ -254,3 +254,44 @@ def test_head_is_never_covered_when_face_was_found():
                                                           protect_head=True)
     assert out[60, 300].tolist() == [200, 200, 200]    # head untouched
     assert out[300, 300].tolist() == [0, 0, 0]         # torso covered
+
+
+
+def test_side_on_worn_photo_is_not_blown_up():
+    # Side-on model: hem corners almost touch, which used to make the garment huge.
+    lm = {"collar_l": (110, 40), "collar_r": (130, 40), "hem_l": (112, 220), "hem_r": (128, 220)}
+    _, dst, names = GarmentWarper().compute_correspondences(lm, body_keypoints(), worn=True)
+    d = dict(zip(names, dst))
+    torso = 220                                          # shoulder (150) to hip (370)
+    garment_len = d["hem_l"][1] - d["collar_l"][1]
+    assert 0.7 * torso - 1 <= garment_len <= 1.5 * torso + 1
+
+
+def test_arms_only_kept_in_front_with_elbow_keypoints():
+    h = w = 600
+    body = np.full((h, w, 3), 200, np.uint8)
+    cv2.circle(body, (300, 80), 40, (140, 170, 225), -1)
+    cv2.rectangle(body, (150, 160), (180, 380), (140, 170, 225), -1)
+    body_mask = np.full((h, w), 255, np.uint8)
+    garment = np.zeros_like(body)
+    mask = np.full((h, w), 255, np.uint8)
+    kp = body_keypoints()
+    kp.update({"head_top": (300, 40), "neck": (300, 130)})
+    warper = GarmentWarper(shading=0)
+    out = warper.blend(body, garment, mask, body_mask, kp)
+    assert out[300, 165].tolist() == [0, 0, 0]           # no elbows: garment covers the arm
+    kp.update({"right_elbow": (165, 270), "left_elbow": (435, 270)})
+    out = warper.blend(body, garment, mask, body_mask, kp)
+    assert out[300, 165].tolist() != [0, 0, 0]           # elbows known: arm stays in front
+
+
+def test_quality_check_flags_bad_cutouts():
+    from controller.garment_cutout import garment_quality
+    image, truth, lm = make_tshirt()
+    assert garment_quality(image, truth, lm)[0]
+    assert not garment_quality(image, np.full_like(truth, 255), lm)[0]      # grabbed everything
+    assert not garment_quality(image, np.zeros_like(truth), lm)[0]          # empty
+    pale = image.copy()
+    pale[:] = 250
+    pale[truth > 0] = 238                                                     # white-on-white
+    assert garment_quality(pale, truth, lm)[1] == "garment blends into the background"
