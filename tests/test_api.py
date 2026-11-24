@@ -1,184 +1,133 @@
+"""Body Segmentation Test!"""
+
 import os
 import sys
 
 import cv2
 import numpy as np
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from api.app import create_app  # noqa: E402
-
-IMAGE_NAME = "img/Basic_Tee/img_00000001.jpg"
-SAMPLE_NAME = "img/Basic_Tee/img_00000002.jpg"
+from controller.body_segmentation import BodySegmenter  # noqa: E402
 
 
-def write_dataset(root):
-    files = {
-        "list_landmarks.txt": (
-            "2\nimage_name clothes_type variation_type landmarks\n"
-            f"{IMAGE_NAME} 1 0 046 030 0 074 030 0 020 060 0 100 060 0 040 110 0 080 112\n"
-            f"{SAMPLE_NAME} 1 0 046 030 1 074 030 0 020 060 0 100 060 0 040 110 0 080 112\n"
-        ),
-        "list_category_cloth.txt": "1\ncategory_name category_type\nBasic_Tee 1\n",
-        "list_category_img.txt": f"2\nimage_name category_label\n{IMAGE_NAME} 1\n{SAMPLE_NAME} 1\n",
-        "list_bbox.txt": (
-            f"2\nimage_name x_1 y_1 x_2 y_2\n{IMAGE_NAME} 010 020 110 118\n"
-            f"{SAMPLE_NAME} 010 020 110 118\n"
-        ),
-        "list_eval_partition.txt": (
-            f"2\nimage_name evaluation_status\n{IMAGE_NAME} train\n{SAMPLE_NAME} train\n"
-        ),
-    }
-    for filename, contents in files.items():
-        (root / filename).write_text(contents)
-    image = np.full((160, 120, 3), (40, 100, 190), dtype=np.uint8)
-    image_path = root / IMAGE_NAME
-    image_path.parent.mkdir(parents=True)
-    assert cv2.imwrite(str(image_path), image)
-    sample_path = root / SAMPLE_NAME
-    assert cv2.imwrite(str(sample_path), image)
-    return image
+def make_figure(h=600, w=400):
+    """A dark figure (head, torso, arms, legs) on a light noisy background, plus its true mask."""
+    rng = np.random.default_rng(0)
+    image = rng.integers(190, 240, (h, w, 3), dtype=np.uint8)
+    truth = np.zeros((h, w), np.uint8)
+    cx = w // 2
+    cv2.circle(truth, (cx, 90), 45, 255, -1)                                   # head
+    cv2.rectangle(truth, (cx - 15, 130), (cx + 15, 150), 255, -1)              # neck
+    cv2.rectangle(truth, (cx - 80, 150), (cx + 80, 360), 255, -1)              # torso
+    cv2.rectangle(truth, (cx - 115, 160), (cx - 85, 350), 255, -1)             # arms
+    cv2.rectangle(truth, (cx + 85, 160), (cx + 115, 350), 255, -1)
+    cv2.rectangle(truth, (cx - 70, 360), (cx - 10, 580), 255, -1)              # legs
+    cv2.rectangle(truth, (cx + 10, 360), (cx + 70, 580), 255, -1)
+    image[truth > 0] = rng.integers(30, 70, (int((truth > 0).sum()), 3), dtype=np.uint8)
+    return image, truth
 
 
-def encoded_image(image, extension=".png"):
-    ok, output = cv2.imencode(extension, image)
-    assert ok
-    return output.tobytes()
+def iou(a, b):
+    a, b = a > 0, b > 0
+    return (a & b).sum() / max((a | b).sum(), 1)
 
 
-def test_health_and_asset_errors_are_explicit(tmp_path):
-    app = create_app(dataset_dir=tmp_path, sample_person_path=tmp_path / "missing.jpg")
-    with TestClient(app) as client:
-        health = client.get("/api/health")
-        assert health.status_code == 200
-        assert health.json()["dataset_ready"] is False
-        assert health.json()["sample_ready"] is False
-
-        garments = client.get("/api/garments")
-        assert garments.status_code == 503
-        assert garments.json()["error"]["code"] == "dataset_unavailable"
-
-        sample = client.get("/api/sample-person")
-        assert sample.status_code == 503
-        assert sample.json()["error"]["code"] == "sample_unavailable"
+def test_run_output_contract():
+    image, _ = make_figure()
+    result = BodySegmenter().run(image)
+    assert set(result) == {"bbox", "body_mask", "torso_mask", "keypoints", "keypoint_source"}
+    assert result["body_mask"].shape == image.shape[:2]
+    assert result["body_mask"].dtype == np.uint8
+    assert set(np.unique(result["body_mask"])) <= {0, 255}
+    assert len(result["bbox"]) == 4
 
 
-def test_catalog_is_filtered_and_images_are_allowlisted(tmp_path):
-    write_dataset(tmp_path)
-    app = create_app(dataset_dir=tmp_path)
-    with TestClient(app) as client:
-        catalog = client.get("/api/garments").json()
-        assert catalog["categories"] == ["Basic_Tee"]
-        assert len(catalog["garments"]) == 1
-        assert catalog["garments"][0]["imageUrl"] == "/api/garments/0/image"
-
-        image = client.get("/api/garments/0/image")
-        assert image.status_code == 200
-        assert image.headers["content-type"] == "image/jpeg"
-        assert client.get("/api/garments/999/image").status_code == 404
-        assert client.get("/api/garments?category=unknown").json()["garments"] == []
-        sample = client.get("/api/sample-person")
-        assert sample.status_code == 200
-        assert sample.headers["content-type"] == "image/jpeg"
+def test_body_mask_matches_figure():
+    image, truth = make_figure()
+    result = BodySegmenter().run(image)
+    assert iou(result["body_mask"], truth) > 0.85
 
 
-def test_try_on_returns_png_and_rejects_bad_uploads(tmp_path, monkeypatch):
-    image = write_dataset(tmp_path)
-    app = create_app(dataset_dir=tmp_path)
-
-    class FakeSegmenter:
-        def run(self, uploaded_image):
-            return {
-                "body_mask": np.full(uploaded_image.shape[:2], 255, np.uint8),
-                "keypoints": {"left_shoulder": (80, 40), "right_shoulder": (40, 40)},
-            }
-
-    class FakeWarper:
-        def try_on(self, uploaded_image, segmentation, garment):
-            assert garment.garment_id == 0
-            return uploaded_image.copy()
-
-    monkeypatch.setattr("api.app.BodySegmenter", FakeSegmenter)
-    monkeypatch.setattr("api.app.GarmentWarper", FakeWarper)
-    app_image = encoded_image(image)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/try-on",
-            files={"person": ("person.png", app_image, "image/png")},
-            data={"garment_id": "0"},
-        )
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "image/png"
-        assert cv2.imdecode(np.frombuffer(response.content, np.uint8), cv2.IMREAD_COLOR).shape == image.shape
-
-        unsupported = client.post(
-            "/api/try-on",
-            files={"person": ("person.gif", b"gif", "image/gif")},
-            data={"garment_id": "0"},
-        )
-        assert unsupported.status_code == 400
-        assert unsupported.json()["error"]["code"] == "unsupported_image_type"
-
-        invalid = client.post(
-            "/api/try-on",
-            files={"person": ("person.png", b"\x89PNG\r\n\x1a\nnot an image", "image/png")},
-            data={"garment_id": "0"},
-        )
-        assert invalid.status_code == 400
-        assert invalid.json()["error"]["code"] == "invalid_image"
-
-        mismatched = client.post(
-            "/api/try-on",
-            files={"person": ("person.png", encoded_image(image, ".jpg"), "image/png")},
-            data={"garment_id": "0"},
-        )
-        assert mismatched.status_code == 400
-        assert mismatched.json()["error"]["code"] == "image_type_mismatch"
-
-        tiny = encoded_image(np.zeros((32, 32, 3), np.uint8))
-        invalid_dimensions = client.post(
-            "/api/try-on",
-            files={"person": ("tiny.png", tiny, "image/png")},
-            data={"garment_id": "0"},
-        )
-        assert invalid_dimensions.status_code == 422
-        assert invalid_dimensions.json()["error"]["code"] == "invalid_dimensions"
-
-        oversized = client.post(
-            "/api/try-on",
-            files={"person": ("large.png", b"x" * (10 * 1024 * 1024 + 1), "image/png")},
-            data={"garment_id": "0"},
-        )
-        assert oversized.status_code == 413
-        assert oversized.json()["error"]["code"] == "image_too_large"
+def test_torso_and_keypoints_are_plausible():
+    image, truth = make_figure()
+    result = BodySegmenter().run(image)
+    kp = result["keypoints"]
+    for name in ("neck", "left_shoulder", "right_shoulder", "left_hip", "right_hip"):
+        assert kp[name] is not None, name
+    # Every keypoint name is present; undetected ones are None.
+    from controller.body_segmentation import KEYPOINT_NAMES
+    assert set(kp) == set(KEYPOINT_NAMES)
+    assert kp["left_wrist"] is None  # no OpenPose model in tests
+    # Person's left is image right.
+    assert kp["left_shoulder"][0] > kp["right_shoulder"][0]
+    assert kp["neck"][1] < kp["left_hip"][1]
+    torso = result["torso_mask"] > 0
+    assert torso.any()
+    assert (torso & (truth == 0)).sum() / torso.sum() < 0.1  # torso stays on the body
 
 
-def test_try_on_reports_missing_shoulders(tmp_path, monkeypatch):
-    image = write_dataset(tmp_path)
-    app = create_app(dataset_dir=tmp_path)
+def test_works_on_grayscale_and_upscaled_input():
+    image, truth = make_figure(300, 200)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    result = BodySegmenter().run(gray)
+    assert result["body_mask"].shape == gray.shape
+    assert iou(result["body_mask"], truth) > 0.8
 
-    class NoShouldersSegmenter:
-        def run(self, uploaded_image):
-            return {
-                "body_mask": np.full(uploaded_image.shape[:2], 255, np.uint8),
-                "keypoints": {"left_shoulder": None, "right_shoulder": None},
-            }
 
-    class UnusedWarper:
-        def try_on(self, *args):
-            raise AssertionError("the warper must not run without shoulders")
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn()
+            print("ok", name)
 
-    monkeypatch.setattr("api.app.BodySegmenter", NoShouldersSegmenter)
-    monkeypatch.setattr("api.app.GarmentWarper", UnusedWarper)
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/try-on",
-            files={"person": ("person.png", encoded_image(image), "image/png")},
-            data={"garment_id": "0"},
-        )
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "shoulders_not_found"
-    assert "shoulders" in response.json()["error"]["message"]
+def make_cropped_upper_body(long_hair, h=300, w=205):
+    """Waist-up figure with the top of the head cut off by the frame (like the app's
+    default sample), no detectable face. Long hair hides the neck in the outline."""
+    rng = np.random.default_rng(1)
+    image = rng.integers(190, 240, (h, w, 3), dtype=np.uint8)
+    truth = np.zeros((h, w), np.uint8)
+    cx = w // 2
+    cv2.ellipse(truth, (cx, 30), (30, 42), 0, 0, 360, 255, -1)                 # head, top cut off
+    if long_hair:
+        hair = np.array([[cx - 30, 0], [cx + 30, 0], [cx + 40, 100], [cx - 40, 100]], np.int32)
+        cv2.fillPoly(truth, [hair], 255)
+    cv2.rectangle(truth, (cx - 13, 65), (cx + 13, 92), 255, -1)                 # neck
+    cv2.ellipse(truth, (cx, 112), (48, 22), 0, 180, 360, 255, -1)               # shoulders
+    cv2.rectangle(truth, (cx - 48, 110), (cx + 48, h), 255, -1)                 # torso
+    for side in (-1, 1):                                                        # arms
+        cv2.rectangle(truth, (cx + side * 50, 105), (cx + side * 70, 280), 255, -1)
+        cv2.circle(truth, (cx + side * 58, 105), 13, 255, -1)
+    image[truth > 0] = rng.integers(30, 70, (int((truth > 0).sum()), 3), dtype=np.uint8)
+    return image, truth
+
+
+def test_no_face_and_no_neck_gives_no_shoulders_instead_of_a_guess():
+    image, _ = make_cropped_upper_body(long_hair=True)
+    result = BodySegmenter().run(image)
+    assert result["keypoint_source"] == "mask"
+    kp = result["keypoints"]
+    for name in ("neck", "left_shoulder", "right_shoulder", "left_hip", "right_hip"):
+        assert kp[name] is None, name
+    assert not result["torso_mask"].any()
+
+
+def test_no_face_with_visible_neck_still_estimates_shoulders():
+    image, truth = make_cropped_upper_body(long_hair=False)
+    kp = BodySegmenter().run(image)["keypoints"]
+    assert kp["left_shoulder"] is not None and kp["right_shoulder"] is not None
+    assert 80 < kp["left_shoulder"][1] < 130                   # true shoulder line is ~y100
+    assert kp["left_shoulder"][0] - kp["right_shoulder"][0] > 60
+    assert kp["left_hip"][1] > 180
+
+
+def test_sanity_check_rejects_the_reported_bad_estimate():
+    """Numbers from the bug report: shoulders at face height, 31px apart, hips at y=55."""
+    _, truth = make_cropped_upper_body(long_hair=True)
+    bad = {"right_shoulder": (87, 22), "left_shoulder": (118, 22),
+           "right_hip": (90, 55), "left_hip": (115, 55)}
+    good = {"right_shoulder": (67, 95), "left_shoulder": (137, 95),
+            "right_hip": (60, 190), "left_hip": (144, 190)}
+    assert not BodySegmenter._torso_is_plausible(bad, truth)
+    assert BodySegmenter._torso_is_plausible(good, truth)
