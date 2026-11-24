@@ -89,7 +89,10 @@ def test_try_on_returns_png_and_rejects_bad_uploads(tmp_path, monkeypatch):
 
     class FakeSegmenter:
         def run(self, uploaded_image):
-            return {"body_mask": np.full(uploaded_image.shape[:2], 255, np.uint8), "keypoints": {}}
+            return {
+                "body_mask": np.full(uploaded_image.shape[:2], 255, np.uint8),
+                "keypoints": {"left_shoulder": (80, 40), "right_shoulder": (40, 40)},
+            }
 
     class FakeWarper:
         def try_on(self, uploaded_image, segmentation, garment):
@@ -150,3 +153,32 @@ def test_try_on_returns_png_and_rejects_bad_uploads(tmp_path, monkeypatch):
         )
         assert oversized.status_code == 413
         assert oversized.json()["error"]["code"] == "image_too_large"
+
+
+def test_try_on_reports_missing_shoulders(tmp_path, monkeypatch):
+    image = write_dataset(tmp_path)
+    app = create_app(dataset_dir=tmp_path)
+
+    class NoShouldersSegmenter:
+        def run(self, uploaded_image):
+            return {
+                "body_mask": np.full(uploaded_image.shape[:2], 255, np.uint8),
+                "keypoints": {"left_shoulder": None, "right_shoulder": None},
+            }
+
+    class UnusedWarper:
+        def try_on(self, *args):
+            raise AssertionError("the warper must not run without shoulders")
+
+    monkeypatch.setattr("api.app.BodySegmenter", NoShouldersSegmenter)
+    monkeypatch.setattr("api.app.GarmentWarper", UnusedWarper)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/try-on",
+            files={"person": ("person.png", encoded_image(image), "image/png")},
+            data={"garment_id": "0"},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "shoulders_not_found"
+    assert "shoulders" in response.json()["error"]["message"]
