@@ -143,7 +143,25 @@ def _process_try_on(app: FastAPI, image: np.ndarray, garment_id: int) -> np.ndar
             app.state.segmenter = BodySegmenter()
         segmentation = app.state.segmenter.run(image)
         garment = app.state.dataset_api.fetch_garment(garment_id)
+        _require_keypoints(segmentation["keypoints"], garment.clothes_type)
         return GarmentWarper().try_on(image, segmentation, garment)
+
+
+def _require_keypoints(keypoints: dict, clothes_type: int) -> None:
+    """Refuse early, with a specific message, when the body keypoints the garment needs are missing."""
+    if clothes_type == 2:  # trousers and skirts hang from the hips
+        if keypoints.get("left_hip") is None or keypoints.get("right_hip") is None:
+            raise ApiProblem(
+                422,
+                "hips_not_found",
+                "We couldn't find your hips. Try a clearer, front-facing, full-length photo.",
+            )
+    elif keypoints.get("left_shoulder") is None or keypoints.get("right_shoulder") is None:
+        raise ApiProblem(
+            422,
+            "shoulders_not_found",
+            "We couldn't find your shoulders. Try a clearer, front-facing photo.",
+        )
 
 
 def create_app(
@@ -333,6 +351,8 @@ def create_app(
 
         try:
             result = await run_in_threadpool(_process_try_on, app, image, garment_id)
+        except ApiProblem:
+            raise
         except ValueError as error:
             raise ApiProblem(
                 422,
