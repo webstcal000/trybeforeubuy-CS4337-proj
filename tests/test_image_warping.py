@@ -295,3 +295,89 @@ def test_quality_check_flags_bad_cutouts():
     pale[:] = 250
     pale[truth > 0] = 238                                                     # white-on-white
     assert garment_quality(pale, truth, lm)[1] == "garment blends into the background"
+
+
+def make_long_sleeve_shirt(h=300, w=260):
+    """A red long-sleeved product shot: sleeves slant down to cuffs by the hem."""
+    rng = np.random.default_rng(4)
+    image = rng.integers(120, 140, (h, w, 3), dtype=np.uint8)
+    poly = np.array([[105, 40], [155, 40], [195, 60], [235, 230], [210, 238], [178, 110],
+                     [175, 260], [85, 260], [82, 110], [50, 238], [25, 230], [65, 60]], np.int32)
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [poly], 255)
+    image[mask > 0] = (40, 40, 200)
+    lm = {"collar_l": (115, 42), "collar_r": (145, 42), "sleeve_l": (37, 234),
+          "sleeve_r": (222, 234), "hem_l": (88, 258), "hem_r": (172, 258)}
+    return Garment(0, "synthetic", "Shirt", {}, clothes_type=1, landmarks=lm,
+                   loader=lambda _: image, mask=mask)
+
+
+def arms_out_keypoints():
+    """T pose: arms straight out sideways at shoulder height."""
+    kp = body_keypoints()
+    kp.update({"head_top": (300, 40), "neck": (300, 130),
+               "right_elbow": (100, 165), "left_elbow": (500, 165),
+               "right_wrist": (20, 170), "left_wrist": (580, 170)})
+    return kp
+
+
+def covered(mask, a, b, n=9):
+    """Share of the points on segment a-b where the warped garment is."""
+    pts = [np.asarray(a) + t * (np.asarray(b) - np.asarray(a)) for t in np.linspace(0.15, 0.85, n)]
+    return np.mean([mask[int(p[1]), int(p[0])] > 127 for p in pts])
+
+
+def test_long_sleeves_swing_onto_outstretched_arms():
+    kp = arms_out_keypoints()
+    warper = GarmentWarper()
+    _, mask = warper.warp(make_long_sleeve_shirt(), kp, (600, 600, 3))
+    for side in ("right", "left"):
+        assert covered(mask, kp[f"{side}_shoulder"], kp[f"{side}_elbow"]) > 0.8, side
+        assert covered(mask, kp[f"{side}_elbow"], kp[f"{side}_wrist"]) > 0.8, side
+    # The cuffs end at the wrists.
+    d = dict(zip(warper.last["names"], warper.last["warped_points"]))
+    assert np.linalg.norm(d["sleeve_l"] - kp["right_wrist"]) < 10      # sleeve_l is image-left
+    assert np.linalg.norm(d["sleeve_r"] - kp["left_wrist"]) < 10
+    # Nothing is left hanging where the sleeves were in the catalog photo.
+    assert mask[330, 205] == 0 and mask[330, 395] == 0
+
+
+def test_moving_the_sleeves_leaves_the_torso_alone():
+    kp = arms_out_keypoints()
+    still = {k: (None if "elbow" in k or "wrist" in k else v) for k, v in kp.items()}
+    warper = GarmentWarper()
+    warper.warp(make_long_sleeve_shirt(), still, (600, 600, 3))
+    before = dict(zip(warper.last["names"], warper.last["warped_points"]))
+    warper.warp(make_long_sleeve_shirt(), kp, (600, 600, 3))
+    after = dict(zip(warper.last["names"], warper.last["warped_points"]))
+    for name in ("collar_l", "collar_r", "hem_l", "hem_r"):
+        assert np.linalg.norm(before[name] - after[name]) < 2, name
+
+
+def test_long_sleeve_bends_at_the_elbow():
+    kp = body_keypoints()
+    kp.update({"right_elbow": (190, 260), "left_elbow": (410, 260),      # elbows out...
+               "right_wrist": (120, 200), "left_wrist": (480, 200)})     # ...forearms raised
+    warper = GarmentWarper()
+    _, mask = warper.warp(make_long_sleeve_shirt(), kp, (600, 600, 3))
+    for side in ("right", "left"):
+        assert covered(mask, kp[f"{side}_elbow"], kp[f"{side}_wrist"]) > 0.8, side
+    # The straight-on line from the upper arm (where an unbent sleeve would go) stays clear.
+    assert mask[340, 140] == 0 and mask[340, 460] == 0
+
+
+def test_moved_sleeve_covers_the_bare_arm_but_not_the_hand():
+    h = w = 600
+    skin = (140, 170, 225)
+    body = np.full((h, w, 3), 210, np.uint8)
+    cv2.circle(body, (300, 80), 40, skin, -1)                              # face: skin reference
+    kp = arms_out_keypoints()
+    for side in ("right", "left"):
+        cv2.line(body, tuple(kp[f"{side}_shoulder"]), tuple(kp[f"{side}_wrist"]), skin, 26)
+    cv2.circle(body, (5, 170), 14, skin, -1)                               # a hand past the cuff
+    seg = {"keypoints": kp, "body_mask": np.full((h, w), 255, np.uint8), "keypoint_source": "face+mask"}
+    out = GarmentWarper(shading=0).try_on(body, seg, make_long_sleeve_shirt())
+    upper_arm = (np.array(kp["right_shoulder"]) + np.array(kp["right_elbow"])) // 2
+    b, g, r = out[upper_arm[1], upper_arm[0]].astype(int)
+    assert r > 150 and b < 100                                             # red sleeve, not skin
+    assert out[170, 5].tolist() == list(skin)                              # the hand still shows
