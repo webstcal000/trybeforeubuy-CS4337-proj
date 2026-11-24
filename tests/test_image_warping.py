@@ -381,3 +381,30 @@ def test_moved_sleeve_covers_the_bare_arm_but_not_the_hand():
     b, g, r = out[upper_arm[1], upper_arm[0]].astype(int)
     assert r > 150 and b < 100                                             # red sleeve, not skin
     assert out[170, 5].tolist() == list(skin)                              # the hand still shows
+
+
+def test_backdrop_left_in_the_cutout_does_not_ride_on_the_sleeves():
+    """GrabCut often keeps the backdrop between sleeve and body; it mustn't go onto the arm."""
+    shirt = make_long_sleeve_shirt()
+    image, mask = shirt.load(), shirt.get_mask()
+    shirt.mask = cv2.dilate(mask, np.ones((11, 11), np.uint8))           # a band of backdrop all round
+    assert (shirt.mask > mask).sum() > 300
+    warper = GarmentWarper()
+    warped, _ = warper.warp(shirt, arms_out_keypoints(), (600, 600, 3))
+    sleeves = warper.last["sleeve_mask"] > 127
+    b, g, r = (warped[sleeves].astype(int)[:, i] for i in range(3))
+    grey = (abs(r - b) < 40) & (abs(r - g) < 40)                         # backdrop, not red fabric
+    assert grey.mean() < 0.02
+
+
+def test_garment_shoulders_sit_on_the_wearers_shoulders():
+    # Shoulder keypoints are the joints (y=150 here, at x=220 and 380). The shirt's
+    # shoulder seam goes over the top of the shoulder, just above the joint; pinning
+    # the neckline to the joints used to hang the whole garment ~0.15 spans too low.
+    warper = GarmentWarper()
+    _, mask = warper.warp(make_long_sleeve_shirt(), body_keypoints(), (600, 600, 3))
+    for x in (220, 380):
+        top = np.nonzero(mask[:, x] > 127)[0][0]
+        assert 150 - 0.3 * 160 < top <= 150, (x, top)
+    d = dict(zip(warper.last["names"], warper.last["dst"]))
+    assert d["collar_l"][1] < 150 - 0.1 * 160            # the neckline is above the joints
