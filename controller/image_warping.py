@@ -271,7 +271,14 @@ class GarmentWarper:
             lo, hi = (0.7, 1.5) if clothes_type == 1 else (1.0, 2.6)
             scale = float(np.clip(scale, lo * torso_len / g_len, hi * torso_len / g_len))
 
-            anchor = along(0.0)               # neckline sits on the shoulder line
+            # Shoulder keypoints are the shoulder joints. The garment's shoulder
+            # seam goes over the top of the shoulder, a little above the joint,
+            # and its neckline sits higher again by the garment's own shoulder
+            # slope. Pinning the neckline to the joints dropped the whole garment
+            # by both amounts, leaving the wearer's own shoulders showing above it.
+            drop = self._shoulder_drop(garment_mask, g_collar, g_u, g_n, 0.5 * span / scale, g_len)
+            drop = self.SHOULDER_DROP * span if drop is None else min(scale * drop, 0.25 * span)
+            anchor = along(-(self.SHOULDER_TOP * span + drop))
 
             def on_torso(p):                  # garment point -> body, following the torso
                 rel = np.asarray(p, np.float64) - g_collar
@@ -316,6 +323,33 @@ class GarmentWarper:
         else:
             torso = dst.copy()
         return src, dst, names, torso, sleeves
+
+    # Fractions of the shoulder-joint span: how far the top of the shoulder is
+    # above the joint, and the usual neckline-to-shoulder drop of a top (used
+    # when the garment's own can't be measured).
+    SHOULDER_TOP, SHOULDER_DROP = 0.1, 0.1
+
+    @staticmethod
+    def _shoulder_drop(mask, collar, g_u, g_n, offset, length):
+        """How far below the collar the garment's top edge is above each shoulder joint.
+
+        Measured on the mask, in garment pixels along g_n, at `offset` either side
+        of the collar centre (where the wearer's shoulder joints fall). None when
+        there's no mask or no shoulder there (a strappy top).
+        """
+        if mask is None:
+            return None
+        h, w = mask.shape[:2]
+        drops = []
+        for side in (-1, 1):
+            ts = np.arange(-0.1 * length, 0.25 * length, 1.0)
+            pts = collar + side * offset * g_u + ts[:, None] * g_n
+            inside = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
+            on = np.zeros(len(ts), bool)
+            on[inside] = mask[pts[inside, 1].astype(int), pts[inside, 0].astype(int)] > 0
+            if on.any():
+                drops.append(max(float(ts[np.argmax(on)]), 0.0))
+        return float(np.mean(drops)) if len(drops) == 2 else None
 
     @staticmethod
     def _garment_torso_width(mask, collar, g_u, g_n, length):
@@ -439,6 +473,25 @@ class GarmentWarper:
         return (labels == lab).astype(np.uint8) * 255
 
     @staticmethod
+    def _clean_sleeve(garment_image, sleeve):
+        """Drop backdrop the cut-out kept along a sleeve's edge (often the gap at the armpit).
+
+        Left beside the torso it went unnoticed; on a sleeve swung out onto the arm
+        it shows as a pale strip. Only pixels near the sleeve's edge that are far
+        from the sleeve's own colour go, so patterns inside the sleeve stay.
+        """
+        on = sleeve > 0
+        if on.sum() < 50:
+            return sleeve
+        lab = cv2.cvtColor(garment_image, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ref = np.median(lab[on], axis=0)
+        far = np.linalg.norm(lab - ref, axis=2) > 40
+        dist = cv2.distanceTransform(on.astype(np.uint8), cv2.DIST_L2, 3)
+        edge = on & (dist < 0.5 * dist.max())
+        cleaned = (on & ~(edge & far)).astype(np.uint8) * 255
+        return cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    @staticmethod
     def _piece_matrix(g_from, g_to, b_from, b_to, width_scale):
         """Affine map of a sleeve piece: g_from -> b_from, g_to -> b_to, width kept at width_scale."""
         g_axis, b_axis = g_to - g_from, b_to - b_from
@@ -451,13 +504,44 @@ class GarmentWarper:
         dst = np.float32([b_from, b_to, b_from + 10 * width_scale * b_perp])
         return cv2.getAffineTransform(src, dst)
 
+    @staticmethod
+    def _fill_armpits(warped, warped_mask, sleeves, width_scale):
+        """Close the wedge that opens between the torso and a sleeve swung outwards.
+
+        Only just below each sleeve's root, so the neckline and the real gap
+        between an outstretched arm and the body are left alone. The new pixels
+        take their colour from the garment around them.
+        """
+        on = warped_mask > 127
+        near = np.zeros(on.shape, bool)
+        half_w = 0.0
+        for plan in sleeves.values():
+            half_w = width_scale * plan["half_w"]            # garment half-width on the body
+            root = plan["pieces"][0][2]
+            disc = np.zeros(on.shape, np.uint8)
+            cv2.circle(disc, (int(root[0]), int(root[1])), int(0.7 * half_w), 255, -1)
+            disc[:max(int(root[1]), 0)] = 0                  # below the root only
+            near |= disc > 0
+        if not near.any():
+            return warped, warped_mask
+        k = max(3, int(0.8 * half_w) | 1)
+        closed = cv2.morphologyEx(on.astype(np.uint8) * 255, cv2.MORPH_CLOSE,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0
+        fill = closed & ~on & near
+        if not fill.any():
+            return warped, warped_mask
+        warped = cv2.inpaint(warped, fill.astype(np.uint8) * 255, 5, cv2.INPAINT_TELEA)
+        warped_mask = warped_mask.copy()
+        warped_mask[fill] = 255
+        return warped, warped_mask
+
     def _warp_sleeves(self, garment_image, garment_mask, sleeves, width_scale, output_shape):
         """Warp each planned sleeve piece. Returns (rgba layer, {side: matrices}) at output_shape."""
         h, w = output_shape[:2]
         layer = np.zeros((h, w, 4), np.float32)
         matrices = {}
         for side, plan in sleeves.items():
-            sleeve = self._sleeve_mask(garment_mask, plan)
+            sleeve = self._clean_sleeve(garment_image, self._sleeve_mask(garment_mask, plan))
             if not sleeve.any():
                 continue
             gh, gw = sleeve.shape
@@ -596,6 +680,7 @@ class GarmentWarper:
         warped = np.clip(layer[..., :3] * a + body.astype(np.float32) * (1 - a) + 0.5, 0, 255).astype(np.uint8)
         warped_mask = np.clip(layer[..., 3] + body_mask.astype(np.float32) * (1 - a[..., 0]) + 0.5,
                               0, 255).astype(np.uint8)
+        warped, warped_mask = self._fill_armpits(warped, warped_mask, sleeves, width_scale)
 
         points = torso_forward(src)
         for i, name in enumerate(names):
