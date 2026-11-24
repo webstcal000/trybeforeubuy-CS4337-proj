@@ -14,8 +14,11 @@ Output of BodySegmenter.run(image) -- this is the contract the warper relies on:
 Keypoint left/right is the PERSON's left/right (OpenPose convention), so for a
 person facing the camera "left_shoulder" appears on the right side of the image.
 The shoulders and hips are filled whenever a body is found. The estimated
-fallback ("face+mask" / "mask") only produces head_top, neck, the shoulders and
-the hips; elbows, wrists, knees etc. are None unless OpenPose is installed.
+fallback ("face+mask" / "mask") produces head_top, neck, the shoulders and hips,
+and elbows and wrists traced along the arms in the body outline (see add_arms).
+An arm that can't be seen in the outline -- held in front of the body, or a hand
+out of the frame -- gets None rather than a guess. Knees, ankles and the face
+points are None unless OpenPose is installed.
 """
 
 import os
@@ -112,6 +115,12 @@ class BodySegmenter:
         x, y, bw, bh = bounding_box
 
         mask = np.full((h, w), cv2.GC_BGD, np.uint8)
+        # Arms held out sideways or overhead reach past the person box, so the
+        # area around it is only probably background. As sure background, the
+        # arms' skin would also teach GrabCut that skin is background, and the
+        # head would be cut off as well.
+        px, py = int(0.4 * bw), int(0.15 * bh)
+        mask[max(y - py, 0):y + bh + py, max(x - px, 0):x + bw + px] = cv2.GC_PR_BGD
         mask[y:y + bh, x:x + bw] = cv2.GC_PR_FGD
         # Pixels on the top/left/right image edge are probably background
         # (the bottom edge is left alone: bodies are often cut off there).
@@ -121,6 +130,10 @@ class BodySegmenter:
         # Seed a sure-foreground core so GrabCut has something to anchor on.
         cx = x + bw // 2
         mask[y + bh // 4:y + 3 * bh // 4, max(cx - bw // 12, 0):cx + bw // 12 + 1] = cv2.GC_FGD
+        # A thin line up through the neck to the head: without a detected face the
+        # head (and so skin colour) is otherwise often lost to the background.
+        thin = max(bw // 60, 1)
+        mask[y + int(0.15 * bh):y + bh // 4, max(cx - thin, 0):cx + thin + 1] = cv2.GC_FGD
         if self.face is not None:
             fx, fy, fw, fh = self.face
             mask[fy + fh // 4:fy + 3 * fh // 4, fx + fw // 4:fx + 3 * fw // 4] = cv2.GC_FGD
@@ -131,6 +144,7 @@ class BodySegmenter:
 
         bgd_model = np.zeros((1, 65), np.float64)
         fgd_model = np.zeros((1, 65), np.float64)
+        cv2.setRNGSeed(0)   # GrabCut starts from a random clustering; same photo, same result
         cv2.grabCut(image, mask, None, bgd_model, fgd_model, self.grabcut_iters, cv2.GC_INIT_WITH_MASK)
 
         body = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
@@ -171,6 +185,21 @@ class BodySegmenter:
             return {}, "mask"
         return self._estimate_keypoints(body_mask), ("face+mask" if self.face is not None else "mask")
 
+    def add_arms(self, image, body_mask, keypoints, source="face+mask"):
+        """Fill in elbows and wrists that the pose model didn't give, from the outline.
+
+        Bare arms are thin and skin-coloured, and GrabCut often drops them, so
+        first pixels of the person's own skin colour that connect to the body are
+        added back to the mask. `source` is how the torso keypoints were found
+        (see detect_keypoints); each way puts them at a different scale.
+        Returns (body_mask, keypoints).
+        """
+        body_mask = self._recover_skin(image, body_mask, keypoints)
+        keypoints = dict(keypoints)
+        for name, point in self._estimate_arms(body_mask, keypoints, source).items():
+            keypoints.setdefault(name, point)
+        return body_mask, keypoints
+
     def segment_torso(self, body_mask, keypoints=None):
         """Return the part of the body mask between the shoulders and the hips."""
         h, w = body_mask.shape
@@ -205,6 +234,7 @@ class BodySegmenter:
         bbox = self.detect_person(work)
         body = self.segment_body(work, bbox)
         keypoints, source = self.detect_keypoints(work, body)
+        body, keypoints = self.add_arms(work, body, keypoints, source)
         torso = self.segment_torso(body, keypoints)
 
         s = 1.0 / self.scale
@@ -306,6 +336,366 @@ class BodySegmenter:
                 points["right_hip"] = (cx - half, hip_y)
                 points["left_hip"] = (cx + half, hip_y)
         return points
+
+    @staticmethod
+    def _recover_skin(image, body_mask, points):
+        """Add skin-coloured regions (bare arms, hands) that touch the body mask.
+
+        Skin colour is sampled from the face, between the top of the head and the
+        neck. If the additions would grow the body by more than a third, the
+        match is probably the background (a beige wall, wood) and nothing is added.
+        """
+        needed = ("head_top", "neck", "right_shoulder", "left_shoulder")
+        if any(points.get(k) is None for k in needed):
+            return body_mask
+        h, w = body_mask.shape
+        head, neck = points["head_top"], points["neck"]
+        span = abs(points["left_shoulder"][0] - points["right_shoulder"][0])
+        y0, y1 = int(head[1] + 0.45 * (neck[1] - head[1])), int(neck[1])
+        x0, x1 = int(max(neck[0] - 0.12 * span, 0)), int(min(neck[0] + 0.12 * span, w))
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+        face = lab[max(y0, 0):max(y1, 0), x0:x1][body_mask[max(y0, 0):max(y1, 0), x0:x1] > 0]
+        if len(face) < 30:
+            return body_mask
+        ref = np.median(face, axis=0)
+        skin = ((np.linalg.norm(lab[..., 1:] - ref[1:], axis=2) < 9)
+                & (np.abs(lab[..., 0] - ref[0]) < 60)).astype(np.uint8) * 255
+        k = max(3, (h // 100) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, kernel)
+        # Above the neck only raised arms are wanted: leave the head's column alone.
+        skin[:int(neck[1]), int(max(neck[0] - 0.35 * span, 0)):int(neck[0] + 0.35 * span)] = 0
+
+        merged = cv2.morphologyEx(body_mask | skin, cv2.MORPH_CLOSE, kernel)
+        n, labels = cv2.connectedComponents(merged)
+        on_body = np.unique(labels[body_mask > 0])
+        grown = np.isin(labels, on_body[on_body > 0]) | (body_mask > 0)
+        added = grown.sum() - (body_mask > 0).sum()
+        if added <= 0 or added > 0.33 * (body_mask > 0).sum():
+            return body_mask
+        return grown.astype(np.uint8) * 255
+
+    # Typical adult arm: shoulder-elbow 33 cm, elbow-wrist 26 cm, hand 19 cm.
+    ELBOW_AT, WRIST_AT = 33 / 78, 59 / 78     # fractions of shoulder -> fingertips
+
+    # Upper-arm length (33 cm) per unit of shoulder-to-hip distance and of shoulder
+    # width, for each way the torso points are found. With the face estimate the
+    # hips are 2.1 head heights below the shoulders and the shoulders at most 2
+    # head heights wide; the outline-only estimate measures the head down to the
+    # middle of the neck, so all its distances come out ~1.3x longer; OpenPose
+    # marks the joints themselves (shoulder joint to hip joint ~50 cm, ~35 cm apart).
+    ARM_SCALE = {"face+mask": (0.81, 0.85), "mask": (0.62, 0.65), "openpose": (0.66, 0.94)}
+
+    def _estimate_arms(self, body_mask, points, source="face+mask"):
+        """Elbows and wrists traced along the arms in the body outline.
+
+        Each upper arm is the direction from the shoulder that stays inside the
+        outline longest without entering the torso or head; the forearm is
+        searched the same way from the elbow, so bent arms are followed. An arm
+        that can't be seen in the outline (held in front of the body, or out of
+        the frame) gets no points rather than a guess.
+        """
+        needed = ("head_top", "neck", "right_shoulder", "left_shoulder", "right_hip", "left_hip")
+        if any(points.get(k) is None for k in needed):
+            return {}
+        sh = {"right": np.array(points["right_shoulder"], np.float64),   # image left
+              "left": np.array(points["left_shoulder"], np.float64)}     # image right
+        hip = {"right": np.array(points["right_hip"], np.float64),
+               "left": np.array(points["left_hip"], np.float64)}
+        span = sh["left"][0] - sh["right"][0]
+        torso_len = (hip["right"][1] + hip["left"][1] - sh["right"][1] - sh["left"][1]) / 2
+        rows = np.nonzero(body_mask.any(axis=1))[0]
+        if span < 10 or len(rows) == 0 or torso_len < 0.18 * (rows[-1] - rows[0] + 1):
+            return {}           # the torso estimate itself is implausible (see check_body_proportions)
+        # Nominal lengths, only used where the arm's own length can't be measured
+        # (it runs out of the frame or into the legs).
+        per_torso, per_span = self.ARM_SCALE.get(source, self.ARM_SCALE["face+mask"])
+        upper = 0.5 * (per_torso * torso_len + per_span * span)
+        fore, hand = upper * 26 / 33, upper * 19 / 33
+        total = upper + fore + hand
+        arm_w = 0.2 * span
+
+        # Torso and head, where an arm can't be told apart from the body. A
+        # forearm crossing in front of the torso (hand on hip) isn't followed:
+        # its wrist is left out rather than guessed.
+        h, w = body_mask.shape
+        blocked = np.zeros((h, w), np.uint8)
+        inset, hip_inset = 0.12 * span, 0.05 * (hip["left"][0] - hip["right"][0])
+        core = np.array([sh["right"] + (inset, 0), sh["left"] - (inset, 0),
+                         hip["left"] - (hip_inset, 0), hip["right"] + (hip_inset, 0)], np.int32)
+        cv2.fillPoly(blocked, [core], 255)
+        # ...and the legs below the hips, which hanging hands sit beside.
+        cv2.rectangle(blocked, (int(core[3][0]), int(min(core[2][1], core[3][1]))),
+                      (int(core[2][0]), h - 1), 255, -1)
+        cx = (sh["right"][0] + sh["left"][0]) / 2
+        top = min(sh["right"][1], sh["left"][1])
+        cv2.rectangle(blocked, (int(cx - 0.28 * span), 0), (int(cx + 0.28 * span), int(top)), 255, -1)
+        free = (body_mask > 0) & (blocked == 0)
+
+        out = {}
+        for side, outward in (("right", -1.0), ("left", 1.0)):
+            pivot = sh[side] - (outward * 0.1 * span, 0)
+            # Upper arm: angles from straight down (0) through sideways (90) to up (180).
+            angles = np.radians(np.arange(-25, 181, 3))
+            dirs = np.stack([outward * np.sin(angles), np.cos(angles)], axis=1)
+            d_up, score = self._best_direction(free, pivot, dirs, upper, arm_w)
+            if d_up is None or score < 0.6:
+                continue
+            # A real arm has width. Without one, the search settles on the thin
+            # strip of torso or leg just outside the blocked area.
+            if self._limb_width(free, pivot, d_up, upper, arm_w) < 0.1 * span:
+                continue
+            reach, left_frame = self._reach(free, pivot, d_up, 1.3 * total)
+            end = reach - 0.5 * arm_w          # where the straight part of the arm ends
+            if end < 0.5 * upper:
+                continue
+
+            elbow = wrist = None
+            if not left_frame and 0.7 * upper <= end <= 1.4 * upper:
+                # The straight run may end at a bent elbow.
+                bent = self._forearm(free, pivot, pivot + d_up * end, d_up, fore, hand, arm_w)
+                if bent is not None:
+                    elbow, wrist = pivot + d_up * end, bent[1]
+            if elbow is None:
+                elbow_d = min(upper, end)
+                elbow = pivot + d_up * elbow_d
+                found = self._forearm(free, pivot, elbow, d_up, fore, hand, arm_w, any_bend=True)
+                wrist = found[1] if found is not None else None
+                # No forearm found: if the arm still runs on well past any plausible
+                # elbow, the nominal elbow was too far out on a straight arm; if it
+                # stops about there, the forearm is just hidden (a hand on the hip).
+                straight = (np.dot(found[0], d_up) > np.cos(np.radians(15)) if found is not None
+                            else not left_frame and reach >= 1.3 * upper)
+                if straight:
+                    # A straight arm: if it ends in the frame, its own length beats
+                    # the nominal one (people and photos vary). The forearm's reach
+                    # is measured along the forearm, which follows the arm better.
+                    d_fore, _, fore_reach, fore_left_frame = found or (d_up, None, 0.0, False)
+                    # The straight run along the upper arm is a lower bound too.
+                    length = max(elbow_d + fore_reach, reach)
+                    if not fore_left_frame and upper < length < 1.25 * total:
+                        elbow = pivot + d_up * (self.ELBOW_AT * length)
+                        wrist = elbow + d_fore * ((self.WRIST_AT - self.ELBOW_AT) * length)
+
+            for name, p in (("elbow", elbow), ("wrist", wrist)):
+                if p is not None and 0 <= p[0] < w and 0 <= p[1] < h:
+                    out[f"{side}_{name}"] = (float(p[0]), float(p[1]))
+                elif name == "elbow":
+                    break               # no wrist without its elbow
+        return out
+
+    def _forearm(self, free, pivot, elbow, d_up, fore, hand, arm_w, any_bend=False):
+        """Search for a forearm leaving the elbow.
+
+        Returns (direction, wrist, reach, left_frame) or None; reach is how far the
+        forearm and hand run from the elbow, left_frame whether the edge stopped it.
+
+        Unless any_bend, only a clear bend counts (35 degrees or more, with the
+        forearm plainly visible); a forearm straight on from the upper arm is the
+        caller's business.
+        """
+        h, w = free.shape
+        base = np.arctan2(d_up[1], d_up[0])
+        bends = np.radians(np.arange(-150, 151, 5))
+        dirs = np.stack([np.cos(base + bends), np.sin(base + bends)], axis=1)
+        # Don't let a folded forearm be found lying on the upper arm itself.
+        near_upper = np.zeros((h, w), np.uint8)
+        cv2.line(near_upper, tuple(int(v) for v in pivot), tuple(int(v) for v in elbow),
+                 255, max(int(1.2 * arm_w), 3))
+        free_fore = free & (near_upper == 0)
+        d_fore, score = self._best_direction(free_fore, elbow, dirs, fore, arm_w,
+                                             prefer=np.abs(np.degrees(bends)) * 0.0015)
+        if d_fore is None or score < 0.6:
+            return None
+        d_fore = self._centre_line(free_fore, elbow, d_fore, fore, arm_w)
+        bend = np.degrees(np.arccos(np.clip(np.dot(d_fore, d_up), -1, 1)))
+        if not any_bend and (bend < 35 or score < 0.75):
+            return None
+        # Traced along the middle of the forearm (on the full outline: the elbow
+        # itself sits inside near_upper), so a slightly-off direction doesn't
+        # slip out of a thin forearm early.
+        reach, left_frame = self._trace(free, elbow, d_fore, 1.3 * (fore + hand), arm_w)
+        if reach < 0.3 * fore:
+            return None
+        if left_frame or reach >= 1.25 * (fore + hand):
+            wrist_d = fore
+        else:
+            wrist_d = reach * 26 / 45            # forearm share of forearm + hand
+        return d_fore, elbow + d_fore * wrist_d, reach, left_frame
+
+    @staticmethod
+    def _limb_width(free, start, d, length, arm_w):
+        """Median width of the run of `free` pixels across the ray, 30-90% along it."""
+        h, w = free.shape
+        n = np.array([-d[1], d[0]])
+        offs = np.arange(-2.0, 2.0001, 0.02) * arm_w
+        c = len(offs) // 2
+        widths = []
+        for t in np.linspace(0.3, 0.9, 7) * length:
+            pts = start + t * d + offs[:, None] * n
+            x, y = np.round(pts[:, 0]).astype(int), np.round(pts[:, 1]).astype(int)
+            ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            on = np.zeros(len(offs), bool)
+            on[ok] = free[y[ok], x[ok]]
+            if not on[c]:
+                widths.append(0.0)
+                continue
+            lo = hi = c
+            while lo > 0 and on[lo - 1]:
+                lo -= 1
+            while hi < len(on) - 1 and on[hi + 1]:
+                hi += 1
+            widths.append(offs[hi] - offs[lo])
+        return float(np.median(widths))
+
+    @staticmethod
+    def _centre_line(free, start, d, length, arm_w):
+        """Turn a limb direction from start towards the middle of the limb.
+
+        The best ray can run along one edge of a limb. Across the ray at several
+        distances, the middle of the limb's run of pixels is found; the returned
+        direction points from start through their centre (start stays put).
+        """
+        h, w = free.shape
+        n = np.array([-d[1], d[0]])
+        offs = np.arange(-1.0, 1.0001, 0.05) * arm_w
+        mids = []
+        for t in np.linspace(0.3, 0.95, 10) * length:
+            p = start + t * d
+            pts = p + offs[:, None] * n
+            x, y = np.round(pts[:, 0]).astype(int), np.round(pts[:, 1]).astype(int)
+            ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            on = np.zeros(len(offs), bool)
+            on[ok] = free[y[ok], x[ok]]
+            if not on.any():
+                continue
+            # The run of limb pixels nearest the ray.
+            idx = np.nonzero(on)[0]
+            c = idx[np.argmin(np.abs(offs[idx]))]
+            lo = hi = c
+            while lo > 0 and on[lo - 1]:
+                lo -= 1
+            while hi < len(on) - 1 and on[hi + 1]:
+                hi += 1
+            if lo == 0 or hi == len(on) - 1:
+                continue        # the run is wider than an arm here (merged with the body)
+            mids.append(p + n * (offs[lo] + offs[hi]) / 2)
+        if len(mids) < 4:
+            return d
+        new_d = np.mean(mids, axis=0) - start
+        new_d /= max(np.linalg.norm(new_d), 1e-6)
+        if np.dot(new_d, d) < np.cos(np.radians(20)):
+            return d            # the fit disagrees wildly; trust the search
+        return new_d
+
+    @staticmethod
+    def _best_direction(free, start, dirs, length, arm_w, prefer=None):
+        """The direction from start whose arm-wide strip lies most inside `free`.
+
+        Returns (unit direction, score in 0..1); score is the inside fraction minus
+        any `prefer` penalty. The middle of the best-scoring run of angles is used,
+        so a wide arm doesn't pull the answer to one edge.
+        """
+        h, w = free.shape
+        ts = np.linspace(0.3, 0.95, 12) * length
+        offsets = np.array([-0.25, 0.0, 0.25]) * arm_w
+        scores = np.zeros(len(dirs))
+        for i, d in enumerate(dirs):
+            n = np.array([-d[1], d[0]])
+            pts = start + ts[:, None, None] * d + offsets[None, :, None] * n
+            pts = pts.reshape(-1, 2)
+            x, y = np.round(pts[:, 0]).astype(int), np.round(pts[:, 1]).astype(int)
+            inside = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            if inside.mean() < 0.5:
+                continue
+            scores[i] = free[y[inside], x[inside]].mean()
+        if prefer is not None:
+            scores = scores - prefer
+        best = int(np.argmax(scores))
+        if scores[best] <= 0:
+            return None, 0.0
+        lo = hi = best
+        while lo > 0 and scores[lo - 1] >= scores[best] - 0.05:
+            lo -= 1
+        while hi < len(scores) - 1 and scores[hi + 1] >= scores[best] - 0.05:
+            hi += 1
+        d = dirs[lo:hi + 1].mean(axis=0)
+        return d / max(np.linalg.norm(d), 1e-6), float(scores[best])
+
+    @staticmethod
+    def _trace(free, start, d, limit, arm_w):
+        """Follow a limb from start, re-centring on it at every step.
+
+        Like _reach, returns (distance, left_frame), but tolerates a direction
+        that is a few degrees off. Where the limb merges with something wider
+        (the body, the legs) it just carries straight on.
+        """
+        h, w = free.shape
+        step = 2.0
+        offs = np.arange(-1.0, 1.0001, 0.1) * arm_w
+        p, d = np.asarray(start, np.float64), np.asarray(d, np.float64)
+        last_p = p
+        travelled, last_in, gap = 0.0, 0.0, 0
+        gap_allowed = max(2, int(0.04 * limit / step))
+        while travelled < limit:
+            p = p + d * step
+            travelled += step
+            x, y = int(round(p[0])), int(round(p[1]))
+            if not (0 <= x < w and 0 <= y < h):
+                return last_in, True
+            if not free[y, x]:
+                gap += 1
+                if gap > gap_allowed:
+                    break
+                continue
+            last_in, last_p, gap = travelled, p, 0
+            n = np.array([-d[1], d[0]])
+            pts = p + offs[:, None] * n
+            xs, ys = np.round(pts[:, 0]).astype(int), np.round(pts[:, 1]).astype(int)
+            ok = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            on = np.zeros(len(offs), bool)
+            on[ok] = free[ys[ok], xs[ok]]
+            c = len(offs) // 2
+            lo = hi = c
+            while lo > 0 and on[lo - 1]:
+                lo -= 1
+            while hi < len(on) - 1 and on[hi + 1]:
+                hi += 1
+            if lo > 0 and hi < len(on) - 1:          # a limb-sized run: ease towards its middle
+                shift = float(np.clip((offs[lo] + offs[hi]) / 2, -0.1 * arm_w, 0.1 * arm_w))
+                new_p = p + n * shift
+                turn = new_p - (p - d * step)
+                d = 0.85 * d + 0.15 * turn / max(np.linalg.norm(turn), 1e-6)
+                d /= max(np.linalg.norm(d), 1e-6)
+                p = last_p = new_p
+        edge = max(3, int(0.01 * max(h, w)))     # the mask often stops just short of the edge
+        near_edge = min(last_p[0], last_p[1], w - 1 - last_p[0], h - 1 - last_p[1]) < edge
+        return last_in, bool(near_edge)
+
+    @staticmethod
+    def _reach(free, start, d, limit):
+        """How far from start along d the outline continues (gaps under 4% of limit are bridged).
+
+        Returns (distance, left_frame): left_frame is True when the image edge,
+        not the end of the arm, stopped it.
+        """
+        h, w = free.shape
+        gap_allowed = max(2, int(0.04 * limit))
+        edge = max(3, int(0.01 * max(h, w)))   # the mask often stops just short of the edge
+        last_in, gap = 0.0, 0
+        for t in np.arange(0, limit, 1.0):
+            x, y = int(round(start[0] + t * d[0])), int(round(start[1] + t * d[1]))
+            if not (0 <= x < w and 0 <= y < h):
+                return last_in, True
+            if free[y, x]:
+                last_in, gap = t, 0
+            else:
+                gap += 1
+                if gap > gap_allowed:
+                    break
+        end = start + last_in * d
+        near_edge = min(end[0], end[1], w - 1 - end[0], h - 1 - end[1]) < edge
+        return last_in, bool(near_edge)
 
 
 def draw_debug(image, result):
