@@ -9,13 +9,16 @@ Inputs
 How it works
   1. compute_correspondences() turns garment landmarks + body keypoints into
      matching point pairs (garment collar -> base of the neck, hem -> hip line,
-     sleeves -> arms when elbow/wrist keypoints exist).
+     sleeve ends -> arms when elbow/wrist keypoints exist).
   2. The garment (with its mask as an alpha channel) is warped onto the body with
      one of three methods, each a fallback for the next:
        "affine"      least-squares affine fit (scale, rotate, shear, move)
        "perspective" homography, needs 4+ pairs (otherwise falls back to affine)
        "tps"         thin plate spline: passes exactly through every pair and
                      bends smoothly in between (implemented with numpy below)
+     With elbow keypoints, each sleeve is cut out of the garment and swung onto
+     its arm separately -- one piece for a short sleeve, two bending at the
+     elbow for a long one -- so the torso of the garment isn't dragged along.
   3. blend() alpha-composites the warped garment with feathered edges.
 """
 
@@ -175,8 +178,22 @@ class GarmentWarper:
         """Return (src, dst, names): matching garment and body points, as Nx2 arrays.
 
         ``worn`` says the garment photo shows someone wearing it (arms hang beside
-        the garment), as opposed to a flat product shot.
+        the garment), as opposed to a flat product shot. With elbow keypoints a
+        sleeve end's dst is on the arm; warp() moves the sleeve there.
         """
+        src, dst, names, _, _ = self._correspondences(garment_landmarks, body_keypoints,
+                                                      clothes_type, garment_mask, worn)
+        return src, dst, names
+
+    def _correspondences(self, garment_landmarks, body_keypoints, clothes_type=1,
+                         garment_mask=None, worn=False):
+        """compute_correspondences() plus (torso_dst, sleeves).
+
+        torso_dst is where each point goes if the garment only follows the torso
+        (sleeves stay in the catalog photo's pose); sleeves is {side: plan} for
+        each sleeve to move onto an arm (see _sleeve_plan).
+        """
+        sleeves = {}
         g = _normalise_sides(
             {k: np.asarray(v, np.float64) for k, v in garment_landmarks.items() if v is not None},
             clothes_type)
@@ -255,14 +272,24 @@ class GarmentWarper:
             scale = float(np.clip(scale, lo * torso_len / g_len, hi * torso_len / g_len))
 
             anchor = along(0.0)               # neckline sits on the shoulder line
-            for name, p in g.items():
-                rel = p - g_collar
-                target = anchor + scale * (u * np.dot(rel, g_u) + n * np.dot(rel, g_n))
-                pairs.append((name, p, target))
 
-            # With elbow/wrist keypoints, pull the sleeve ends onto the arms.
-            arm = dict((name, t) for name, _, t in self._sleeve_pairs(g, kp, sh))
+            def on_torso(p):                  # garment point -> body, following the torso
+                rel = np.asarray(p, np.float64) - g_collar
+                return anchor + scale * (u * np.dot(rel, g_u) + n * np.dot(rel, g_n))
+
+            for name, p in g.items():
+                pairs.append((name, p, on_torso(p)))
+            torso_dst = {name: t for name, _, t in pairs}
+
+            # With elbow/wrist keypoints, the sleeve ends go onto the arms.
+            arm = {name: t for name, _, t in self._sleeve_pairs(g, kp, sh)}
             pairs = [(name, p, arm.get(name, t)) for name, p, t in pairs]
+            half_w = 0.5 * (g_width if g_width else 2 * np.linalg.norm(g["collar_r"] - g["collar_l"]))
+            for side in "lr":
+                plan = self._sleeve_plan(g, arm, kp, side, g_collar, g_u, g_n, g_len, half_w,
+                                         on_torso)
+                if plan is not None:
+                    sleeves[side] = plan
 
         else:  # trousers / skirts
             if hip["l"] is None or hip["r"] is None:
@@ -284,7 +311,11 @@ class GarmentWarper:
         names = [p[0] for p in pairs]
         src = np.array([p[1] for p in pairs], np.float64)
         dst = np.array([p[2] for p in pairs], np.float64)
-        return src, dst, names
+        if clothes_type in (1, 3):
+            torso = np.array([torso_dst[name] for name in names], np.float64)
+        else:
+            torso = dst.copy()
+        return src, dst, names, torso, sleeves
 
     @staticmethod
     def _garment_torso_width(mask, collar, g_u, g_n, length):
@@ -347,6 +378,113 @@ class GarmentWarper:
                 target = sh[side] + 0.5 * (elbow - sh[side])
             out.append((name, g[name], target))
         return out
+
+    # Upper arm : forearm = 33 : 26, so a straight long sleeve bends this far along.
+    SLEEVE_ELBOW_AT = 33 / 59
+
+    @classmethod
+    def _sleeve_plan(cls, g, arm_targets, kp, side, g_collar, g_u, g_n, g_len, half_w, on_torso):
+        """How to move one sleeve onto its arm, or None to leave it with the torso.
+
+        The sleeve turns about a pivot near the top of its seam (a fifth of the
+        way from the shoulder point down to the armpit), so it stays attached to
+        the warped torso. A short sleeve is one piece pointing down the upper
+        arm; a long sleeve is two pieces that bend at the elbow.
+        """
+        name = f"sleeve_{side}"
+        elbow = _body_point(kp, side, "elbow")
+        if name not in g or name not in arm_targets or elbow is None:
+            return None
+        sign = -1.0 if side == "l" else 1.0
+        g_sh = g_collar + sign * half_w * g_u + 0.05 * g_len * g_n
+        g_ax = g_collar + sign * half_w * g_u + 0.28 * g_len * g_n
+        pivot = g_sh + 0.2 * (g_ax - g_sh)
+        cuff = g[name]
+        if np.linalg.norm(cuff - pivot) < 1e-3:
+            return None
+        b_pivot = on_torso(pivot)
+        collar = g.get(f"collar_{side}")
+        hem = g.get(f"hem_{side}", g.get(f"waist_{side}"))
+        long_sleeve = (collar is not None and hem is not None
+                       and cuff[1] - collar[1] > 0.6 * (hem[1] - collar[1]))
+        if long_sleeve:
+            g_elbow = pivot + cls.SLEEVE_ELBOW_AT * (cuff - pivot)
+            pieces = [(pivot, g_elbow, b_pivot, elbow), (g_elbow, cuff, elbow, arm_targets[name])]
+        else:
+            pieces = [(pivot, cuff, b_pivot, arm_targets[name])]
+        return {"sign": sign, "collar": g_collar, "across": g_u, "half_w": half_w,
+                "pivot": pivot, "cuff": cuff, "pieces": pieces}
+
+    @staticmethod
+    def _sleeve_mask(garment_mask, plan):
+        """The sleeve's pixels in the garment photo: beyond the torso's side, joined to the cuff."""
+        h, w = garment_mask.shape[:2]
+        ys, xs = np.mgrid[0:h, 0:w]
+        across = (xs - plan["collar"][0]) * plan["across"][0] + (ys - plan["collar"][1]) * plan["across"][1]
+        beyond = plan["sign"] * across > plan["half_w"]
+        region = ((garment_mask > 127) & beyond).astype(np.uint8)
+        # Drop slivers of the torso's own edge that reach past the measured width.
+        k = max(3, int(0.08 * plan["half_w"]) | 1)
+        region = cv2.morphologyEx(region, cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        n, labels = cv2.connectedComponents(region)
+        if n <= 1:
+            return np.zeros((h, w), np.uint8)
+        cx, cy = (int(np.clip(v, 0, m - 1)) for v, m in zip(plan["cuff"], (w, h)))
+        lab = labels[cy, cx]
+        if lab == 0:                                   # cuff landmark just off the mask
+            on = np.argwhere(labels > 0)
+            near = on[np.argmin(np.hypot(on[:, 0] - cy, on[:, 1] - cx))]
+            lab = labels[near[0], near[1]]
+        return (labels == lab).astype(np.uint8) * 255
+
+    @staticmethod
+    def _piece_matrix(g_from, g_to, b_from, b_to, width_scale):
+        """Affine map of a sleeve piece: g_from -> b_from, g_to -> b_to, width kept at width_scale."""
+        g_axis, b_axis = g_to - g_from, b_to - b_from
+        g_len, b_len = np.linalg.norm(g_axis), np.linalg.norm(b_axis)
+        if g_len < 1e-6 or b_len < 1e-6:
+            return None
+        g_perp = np.array([-g_axis[1], g_axis[0]]) / g_len
+        b_perp = np.array([-b_axis[1], b_axis[0]]) / b_len
+        src = np.float32([g_from, g_to, g_from + 10 * g_perp])
+        dst = np.float32([b_from, b_to, b_from + 10 * width_scale * b_perp])
+        return cv2.getAffineTransform(src, dst)
+
+    def _warp_sleeves(self, garment_image, garment_mask, sleeves, width_scale, output_shape):
+        """Warp each planned sleeve piece. Returns (rgba layer, {side: matrices}) at output_shape."""
+        h, w = output_shape[:2]
+        layer = np.zeros((h, w, 4), np.float32)
+        matrices = {}
+        for side, plan in sleeves.items():
+            sleeve = self._sleeve_mask(garment_mask, plan)
+            if not sleeve.any():
+                continue
+            gh, gw = sleeve.shape
+            ys, xs = np.mgrid[0:gh, 0:gw]
+            pieces = plan["pieces"]
+            matrices[side] = []
+            # Draw the forearm piece first so the upper-arm piece covers the elbow joint.
+            for i in reversed(range(len(pieces))):
+                g_from, g_to, b_from, b_to = pieces[i]
+                M = self._piece_matrix(g_from, g_to, b_from, b_to, width_scale)
+                if M is None:
+                    continue
+                matrices[side].insert(0, M)
+                axis = g_to - g_from
+                t = ((xs - g_from[0]) * axis[0] + (ys - g_from[1]) * axis[1]) / max(np.dot(axis, axis), 1e-6)
+                part = sleeve.copy()
+                if len(pieces) > 1:
+                    # Overlap the pieces a little at the elbow so no gap opens.
+                    keep = (t <= 1.06) if i == 0 else (t >= -0.06)
+                    part[~keep] = 0
+                rgba = np.dstack([garment_image, part])
+                out = cv2.warpAffine(rgba, M, (w, h), flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
+                a = out[..., 3:] / 255.0
+                layer[..., :3] = out[..., :3] * a + layer[..., :3] * (1 - a)
+                layer[..., 3:] = 255.0 * a + layer[..., 3:] * (1 - a)
+        return layer, matrices
 
     # ------------------------------------------------------------------ warps
     @staticmethod
@@ -423,27 +561,67 @@ class GarmentWarper:
         method = method or self.method
         image = garment.load()
         mask = garment.get_mask()
-        src, dst, names = self.compute_correspondences(
+        src, dst, names, torso_dst, sleeves = self._correspondences(
             garment.get_landmarks(), body_keypoints, garment.clothes_type, mask,
             worn=getattr(garment, "photo_kind", None) == "worn")
         fn = {"affine": self.affine_warp, "perspective": self.perspective_warp,
               "tps": self.tps_warp}[method]
         self.last = {"method": method, "names": names, "src": src, "dst": dst}
-        warped, warped_mask = fn(image, src, dst, output_shape=output_shape, garment_mask=mask)
-        self.last["warped_points"] = self.last["forward"](src)
+        if not sleeves:
+            warped, warped_mask = fn(image, src, dst, output_shape=output_shape, garment_mask=mask)
+            self.last["warped_points"] = self.last["forward"](src)
+            self.last["warped_mask"] = warped_mask
+            self.last["sleeve_mask"] = None
+            return warped, warped_mask
+
+        # Sleeves that follow the arms: the torso is warped as if the sleeves
+        # stayed put, but without them; each sleeve is then cut out and swung
+        # onto its arm in one piece (short) or two pieces bending at the elbow.
+        # The first bit of each sleeve stays with the torso as a shoulder cap, so
+        # no notch opens at the shoulder whichever way the arm points.
+        sleeve_px = np.zeros_like(mask)
+        ys, xs = np.mgrid[0:mask.shape[0], 0:mask.shape[1]]
+        for plan in sleeves.values():
+            axis = plan["cuff"] - plan["pivot"]
+            t = ((xs - plan["pivot"][0]) * axis[0] + (ys - plan["pivot"][1]) * axis[1]) / max(np.dot(axis, axis), 1e-6)
+            sleeve_px |= np.where(t > 0.12, self._sleeve_mask(mask, plan), 0).astype(np.uint8)
+        torso_mask = np.where(sleeve_px > 0, 0, mask).astype(np.uint8)
+        body, body_mask = fn(image, src, torso_dst, output_shape=output_shape, garment_mask=torso_mask)
+        torso_forward = self.last["forward"]
+        M = fit_affine(src, torso_dst)
+        width_scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+        layer, matrices = self._warp_sleeves(image, mask, sleeves, width_scale, output_shape)
+
+        a = layer[..., 3:] / 255.0
+        warped = np.clip(layer[..., :3] * a + body.astype(np.float32) * (1 - a) + 0.5, 0, 255).astype(np.uint8)
+        warped_mask = np.clip(layer[..., 3] + body_mask.astype(np.float32) * (1 - a[..., 0]) + 0.5,
+                              0, 255).astype(np.uint8)
+
+        points = torso_forward(src)
+        for i, name in enumerate(names):
+            side = name[-1]
+            if name.startswith("sleeve_") and matrices.get(side):
+                points[i] = _apply_matrix(matrices[side][-1], src[i:i + 1])[0]
+
+        self.last["forward"] = torso_forward     # the garment's torso; sleeves are in matrices
+        self.last["sleeve_matrices"] = matrices
+        self.last["warped_points"] = points
         self.last["warped_mask"] = warped_mask
+        self.last["sleeve_mask"] = layer[..., 3].astype(np.uint8)
         return warped, warped_mask
 
     # ------------------------------------------------------------------ blend
     def blend(self, body_image, warped_garment, garment_mask, body_mask=None, keypoints=None,
-              protect_head=False):
+              protect_head=False, sleeve_mask=None):
         """Composite the warped garment over the photo.
 
         * soft (feathered) garment edges;
         * broad shading from the photo is carried onto the garment, so it is not flat;
         * bare arms beside the torso stay in front of the garment (needs keypoints);
         * protect_head: never draw over the head (only use when the keypoints come
-          from a detected face or pose model, so the head position is trustworthy).
+          from a detected face or pose model, so the head position is trustworthy);
+        * sleeve_mask: where warp() moved a sleeve onto an arm; the sleeve covers
+          the arm there instead of the arm showing through it.
         """
         h, w = body_image.shape[:2]
         alpha = garment_mask.astype(np.float32) / 255.0
@@ -467,6 +645,8 @@ class GarmentWarper:
         if use_arms and keypoints is not None:
             arms = self._arm_mask(body_image, body_mask, keypoints)
             if arms is not None:
+                if sleeve_mask is not None:
+                    arms = arms * (sleeve_mask < 128)
                 alpha *= 1.0 - arms
         sigma = self.feather * np.hypot(h, w)
         if sigma > 0.3:
@@ -553,4 +733,5 @@ class GarmentWarper:
         warped, mask = self.warp(garment, segmentation["keypoints"], body_image.shape, method)
         trusted = segmentation.get("keypoint_source") in ("face+mask", "openpose")
         return self.blend(body_image, warped, mask, segmentation.get("body_mask"),
-                          segmentation.get("keypoints"), protect_head=trusted)
+                          segmentation.get("keypoints"), protect_head=trusted,
+                          sleeve_mask=self.last.get("sleeve_mask"))
