@@ -1,4 +1,7 @@
-"""Body Segmentation Test!"""
+"""Smoke tests for BodySegmenter on a synthetic person-shaped figure.
+
+Run with:  python -m pytest tests   (or:  python tests/test_body_segmentation.py)
+"""
 
 import os
 import sys
