@@ -461,16 +461,11 @@ class BodySegmenter:
                 elbow = pivot + d_up * elbow_d
                 found = self._forearm(free, pivot, elbow, d_up, fore, hand, arm_w, any_bend=True)
                 wrist = found[1] if found is not None else None
-                # No forearm found: if the arm still runs on well past any plausible
-                # elbow, the nominal elbow was too far out on a straight arm; if it
-                # stops about there, the forearm is just hidden (a hand on the hip).
-                straight = (np.dot(found[0], d_up) > np.cos(np.radians(15)) if found is not None
-                            else not left_frame and reach >= 1.3 * upper)
-                if straight:
+                if found is not None and np.dot(found[0], d_up) > np.cos(np.radians(15)):
                     # A straight arm: if it ends in the frame, its own length beats
                     # the nominal one (people and photos vary). The forearm's reach
                     # is measured along the forearm, which follows the arm better.
-                    d_fore, _, fore_reach, fore_left_frame = found or (d_up, None, 0.0, False)
+                    d_fore, _, fore_reach, fore_left_frame = found
                     # The straight run along the upper arm is a lower bound too.
                     length = max(elbow_d + fore_reach, reach)
                     if not fore_left_frame and upper < length < 1.25 * total:
