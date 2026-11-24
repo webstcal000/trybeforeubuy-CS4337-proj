@@ -98,17 +98,46 @@ def _cut_from_backdrop(image, bg, tolerance=14):
     return _clean(mask)
 
 
+def product_shot_mask(image):
+    """Garment mask if the photo is a flat product shot (no person, plain backdrop), else None."""
+    bg = plain_background(image)
+    if bg is None:
+        return None
+    mask = _cut_from_backdrop(image, bg)
+    skin_share = (skin_mask(image)[mask > 0] > 0).mean() if mask.any() else 1.0
+    if mask.mean() > 255 * 0.05 and skin_share < 0.03:
+        return mask
+    return None
+
+
+def photo_kind(image):
+    """"product" for a flat product shot, "worn" when someone is wearing the garment."""
+    return "product" if product_shot_mask(image) is not None else "worn"
+
+
+def _below_hem(shape, landmarks, margin):
+    """Mask of everything below the line through the hem corners, pushed down by ``margin`` px."""
+    if "hem_l" not in landmarks or "hem_r" not in landmarks:
+        return None
+    h, w = shape[:2]
+    (x1, y1), (x2, y2) = landmarks["hem_l"], landmarks["hem_r"]
+    if abs(x2 - x1) < 1:
+        return None
+    slope = (y2 - y1) / (x2 - x1)
+    xs = np.arange(w)
+    line = y1 + slope * (xs - x1) + margin
+    return np.arange(h)[:, None] > line[None, :]
+
+
 def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations=5):
     """Return a uint8 mask (255 = garment) the same size as ``image``."""
     h, w = image.shape[:2]
-    bg = plain_background(image)
-    if bg is not None:
+    product = product_shot_mask(image)
+    if product is not None:
         # Flat product shot: whatever isn't backdrop is the garment. More reliable
         # than GrabCut for light garments on white.
-        mask = _cut_from_backdrop(image, bg)
-        skin_share = (skin_mask(image)[mask > 0] > 0).mean() if mask.any() else 1.0
-        if mask.mean() > 255 * 0.05 and skin_share < 0.03:
-            return mask   # no person in the photo: a flat product shot
+        return product
+    bg = plain_background(image)
     landmarks = landmarks or {}
     gc = np.full((h, w), cv2.GC_BGD, np.uint8)
 
@@ -140,6 +169,11 @@ def cut_out_garment(image, bbox=None, landmarks=None, clothes_type=1, iterations
         # Model photographed on a plain backdrop: the backdrop is certainly not garment.
         diff = np.abs(image.astype(np.float32) - bg[None, None]).max(axis=2)
         gc[diff <= 8] = cv2.GC_BGD
+
+    # A worn garment ends at its hem: trousers and legs below it are background.
+    below = _below_hem((h, w), landmarks, 0.04 * (y2 - y1))
+    if below is not None:
+        gc[below] = cv2.GC_BGD
 
     core = _core_polygon(landmarks, clothes_type)
     if core is not None:

@@ -35,6 +35,18 @@ LANDMARK_NAMES = {
 CLOTHES_TYPE_NAMES = {UPPER: "upper", LOWER: "lower", FULL: "full"}
 
 
+def is_back_view(landmarks, clothes_type):
+    """True when the photo shows the garment from behind.
+
+    DeepFashion labels left/right from the wearer's point of view, so from the
+    front "_l" points sit on the image's left; from behind they swap sides.
+    """
+    left, right = ("waist_l", "waist_r") if clothes_type == LOWER else ("collar_l", "collar_r")
+    if left not in landmarks or right not in landmarks:
+        return False
+    return landmarks[left][0] > landmarks[right][0]
+
+
 def _read_list(path):
     """Read a DeepFashion list file: line 1 = count, line 2 = header, then rows."""
     with open(path) as fh:
@@ -144,8 +156,12 @@ class DeepFashionDataset:
             "partition": self.partition[index],
         }
 
-    def select(self, clothes_type=None, categories=None, partition=None, fully_visible=True):
-        """Indices of items matching the filters (categories: list of names)."""
+    def select(self, clothes_type=None, categories=None, partition=None, fully_visible=True,
+               front_only=True):
+        """Indices of items matching the filters (categories: list of names).
+
+        front_only skips photos taken from behind, which can't be tried on.
+        """
         wanted = {c.lower() for c in categories} if categories else None
         out = []
         for i in range(len(self.names)):
@@ -154,6 +170,8 @@ class DeepFashionDataset:
             if partition is not None and self.partition[i] != partition:
                 continue
             if fully_visible and any(v != 0 for v in self.visibility[i].values()):
+                continue
+            if front_only and is_back_view(self.landmarks[i], int(self.clothes_type[i])):
                 continue
             if wanted and self.categories[self.category_label[i] - 1][0].lower() not in wanted:
                 continue

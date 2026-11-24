@@ -191,3 +191,66 @@ def test_beige_clothing_is_not_treated_as_arms():
     arms = GarmentWarper._arm_mask(body, body_mask, kp)
     assert arms[300, 165] == 1                   # the bare arm is found
     assert arms[300, 200] == 0                   # the beige hoodie is not
+
+
+# ---------------------------------------------------------------- bomber fixes
+
+def test_back_view_labels_do_not_flip_the_garment():
+    _, _, lm = make_tshirt()
+    # Back-view photo: DeepFashion's left/right labels swap sides.
+    swapped = {k[:-2] + ("_r" if k.endswith("_l") else "_l"): v for k, v in lm.items()}
+    src, dst, names = GarmentWarper().compute_correspondences(swapped, body_keypoints())
+    d = dict(zip(names, dst))
+    assert d["hem_l"][1] > d["collar_l"][1] + 50      # still hangs down from the shoulders
+    assert d["collar_l"][0] < d["collar_r"][0]
+
+
+def test_worn_photo_is_sized_by_hem_corners_not_arms():
+    image, mask, lm = make_tshirt()
+    # Model's arms hanging beside the shirt make the mask much wider than the shirt.
+    cv2.rectangle(mask, (20, 100), (75, 250), 255, -1)
+    cv2.rectangle(mask, (165, 100), (220, 250), 255, -1)
+    w = GarmentWarper()
+    _, dst_flat, names = w.compute_correspondences(lm, body_keypoints(), garment_mask=mask, worn=False)
+    _, dst_worn, _ = w.compute_correspondences(lm, body_keypoints(), garment_mask=mask, worn=True)
+    i_l, i_r = names.index("hem_l"), names.index("hem_r")
+    flat_w = dst_flat[i_r][0] - dst_flat[i_l][0]
+    worn_w = dst_worn[i_r][0] - dst_worn[i_l][0]
+    assert worn_w > 1.4 * flat_w                         # arms no longer shrink it
+    assert abs(worn_w - 0.92 * 160) < 15                 # hem spans the torso width
+
+
+def test_cutout_drops_trousers_below_the_hem():
+    image, truth, lm = make_tshirt()
+    rng = np.random.default_rng(5)
+    image[:] = rng.integers(60, 200, image.shape, dtype=np.uint8)   # busy, non-plain scene
+    image[truth > 0] = (40, 40, 200)
+    cv2.rectangle(image, (80, 262), (160, 299), (40, 40, 190), -1) # trousers close in colour
+    mask = cut_out_garment(image, (30, 35, 210, 299), lm, clothes_type=1)
+    assert mask[285, 120] == 0
+    assert mask[200, 120] > 0
+
+
+def test_body_proportion_check_rejects_keypoints_on_the_face():
+    from controller.image_warping import check_body_proportions
+    body = np.zeros((300, 205), np.uint8)
+    body[:, 30:180] = 255
+    bad = {"keypoint_source": "mask", "body_mask": body,
+           "keypoints": {"left_shoulder": (102, 22), "right_shoulder": (71, 22),
+                         "left_hip": (99, 55), "right_hip": (74, 55)}}
+    with pytest.raises(ValueError):
+        check_body_proportions(bad)
+    good = dict(bad, keypoints={"left_shoulder": (140, 95), "right_shoulder": (70, 95),
+                                "left_hip": (130, 190), "right_hip": (80, 190)})
+    check_body_proportions(good)
+
+
+def test_head_is_never_covered_when_face_was_found():
+    body = np.full((600, 600, 3), 200, np.uint8)
+    garment = np.zeros_like(body)
+    mask = np.full((600, 600), 255, np.uint8)          # garment everywhere, including the head
+    kp = body_keypoints()
+    out = GarmentWarper(shading=0, keep_arms=False).blend(body, garment, mask, None, kp,
+                                                          protect_head=True)
+    assert out[60, 300].tolist() == [200, 200, 200]    # head untouched
+    assert out[300, 300].tolist() == [0, 0, 0]         # torso covered

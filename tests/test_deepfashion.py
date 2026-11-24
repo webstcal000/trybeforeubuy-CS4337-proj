@@ -80,3 +80,14 @@ def test_api_search(tmp_path):
     assert api.search("tee") == [0]
     assert api.search("jean") == [1]
     assert api.fetch_garment(1).category == "Jeans"
+
+
+def test_select_skips_back_views(tmp_path):
+    write_fake_dataset(tmp_path)
+    # Make item 0 a back view: collar_l on the image right.
+    p = tmp_path / "list_landmarks.txt"
+    s = p.read_text().replace("0 046 030  0 074 030", "0 074 030  0 046 030", 1)
+    p.write_text(s)
+    ds = DeepFashionDataset(str(tmp_path)).load_annotations()
+    assert 0 not in ds.select(clothes_type=1)
+    assert 0 in ds.select(clothes_type=1, front_only=False)

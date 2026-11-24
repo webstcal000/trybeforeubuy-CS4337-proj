@@ -110,6 +110,47 @@ def _body_point(keypoints, image_side, part):
     return None if p is None else np.asarray(p, np.float64)
 
 
+def _normalise_sides(g, clothes_type):
+    """Make "_l" landmarks the image-left ones (back-view photos have them swapped)."""
+    left, right = ("waist_l", "waist_r") if clothes_type == 2 else ("collar_l", "collar_r")
+    if left in g and right in g and g[left][0] > g[right][0]:
+        swapped = {}
+        for k, v in g.items():
+            if k.endswith("_l"):
+                swapped[k[:-2] + "_r"] = v
+            elif k.endswith("_r"):
+                swapped[k[:-2] + "_l"] = v
+            else:
+                swapped[k] = v
+        return swapped
+    return g
+
+
+def check_body_proportions(segmentation):
+    """Raise ValueError when the keypoints can't be the person's real torso.
+
+    Guessed keypoints (no face or pose model) can land on the face: in one
+    DeepFashion photo the shoulder-to-hip distance came out at 11% of the body's
+    height. A real torso is roughly 30-60% of the visible body.
+    """
+    kp = segmentation.get("keypoints") or {}
+    body = segmentation.get("body_mask")
+    if body is None or segmentation.get("keypoint_source") == "openpose":
+        return
+    sh = [kp.get("left_shoulder"), kp.get("right_shoulder")]
+    hp = [kp.get("left_hip"), kp.get("right_hip")]
+    if None in sh or None in hp:
+        return
+    rows = np.nonzero((body > 0).any(axis=1))[0]
+    if len(rows) == 0:
+        return
+    body_h = rows[-1] - rows[0] + 1
+    torso = (hp[0][1] + hp[1][1]) / 2 - (sh[0][1] + sh[1][1]) / 2
+    if torso < 0.18 * body_h:
+        raise ValueError(f"torso keypoints look wrong (shoulder-to-hip is {torso:.0f}px of a "
+                         f"{body_h}px tall body); body detection probably failed")
+
+
 class GarmentWarper:
     """Aligns garment landmarks to body keypoints and blends the result."""
 
@@ -126,9 +167,16 @@ class GarmentWarper:
         self.last = {}                          # details of the most recent warp, for evaluation
 
     # ---------------------------------------------------------- correspondences
-    def compute_correspondences(self, garment_landmarks, body_keypoints, clothes_type=1, garment_mask=None):
-        """Return (src, dst, names): matching garment and body points, as Nx2 arrays."""
-        g = {k: np.asarray(v, np.float64) for k, v in garment_landmarks.items() if v is not None}
+    def compute_correspondences(self, garment_landmarks, body_keypoints, clothes_type=1,
+                                garment_mask=None, worn=False):
+        """Return (src, dst, names): matching garment and body points, as Nx2 arrays.
+
+        ``worn`` says the garment photo shows someone wearing it (arms hang beside
+        the garment), as opposed to a flat product shot.
+        """
+        g = _normalise_sides(
+            {k: np.asarray(v, np.float64) for k, v in garment_landmarks.items() if v is not None},
+            clothes_type)
         kp = {k: v for k, v in body_keypoints.items() if v is not None}
         sh = {s: _body_point(kp, s, "shoulder") for s in "lr"}
         hip = {s: _body_point(kp, s, "hip") for s in "lr"}
@@ -164,21 +212,32 @@ class GarmentWarper:
             if "collar_l" not in g or "collar_r" not in g:
                 raise ValueError("tops and dresses need both collar landmarks")
             g_collar = (g["collar_l"] + g["collar_r"]) / 2
-            g_u = g["collar_r"] - g["collar_l"]
-            g_u /= max(np.linalg.norm(g_u), 1e-6)
-            g_n = np.array([-g_u[1], g_u[0]])
             low = [g[k] for k in ("waist_l", "waist_r", "hem_l", "hem_r") if k in g]
-            g_low = np.mean(low, axis=0) if low else g_collar + g_n * 100
-            g_len = max(float(np.dot(g_low - g_collar, g_n)), 1e-6)
+            # "Down" the garment runs from the collar to the hem. Taking it from the
+            # left/right labels instead flips the garment when they're swapped.
+            if low:
+                g_n = np.mean(low, axis=0) - g_collar
+                g_n /= max(np.linalg.norm(g_n), 1e-6)
+            else:
+                g_n = np.array([0.0, 1.0])
+            g_u = np.array([g_n[1], -g_n[0]])                  # across, image-left -> right
+            g_len = max(float(np.dot(np.mean(low, axis=0) - g_collar, g_n)), 1e-6) if low else 100.0
 
-            # Size the garment by its own torso width (measured on its mask below
-            # the armpits, where sleeves don't interfere) against the wearer's
-            # torso width, and keep the garment's proportions. Hem width is a poor
-            # size reference: many tops curve in or flare out at the hem.
-            g_width = self._garment_torso_width(garment_mask, g_collar, g_u, g_n, g_len)
+            # Size the garment by its own torso width against the wearer's, keeping
+            # the garment's proportions.
+            #  * Flat product shot: measure across the mask below the armpits (the
+            #    hem can curve in or flare out, so it's a poor reference there).
+            #  * Worn photo: that measurement runs across the model's arms too,
+            #    about twice too wide, so use the distance between the hem corners
+            #    (waist corners for dresses).
+            corners = None
+            for a, b in (("waist_l", "waist_r"), ("hem_l", "hem_r")):
+                if a in g and b in g:
+                    corners = abs(float(np.dot(g[b] - g[a], g_u)))
+                    break
+            g_width = None if worn else self._garment_torso_width(garment_mask, g_collar, g_u, g_n, g_len)
             if g_width is None:
-                g_width = np.linalg.norm(low[1] - low[0]) if len(low) >= 2 else 3 * np.linalg.norm(
-                    g["collar_r"] - g["collar_l"])
+                g_width = corners if corners else 3 * np.linalg.norm(g["collar_r"] - g["collar_l"])
             body_width = 0.92 * span          # shoulder-tip span is a bit wider than the torso
             scale = body_width / max(g_width, 1e-6)
 
@@ -352,7 +411,8 @@ class GarmentWarper:
         image = garment.load()
         mask = garment.get_mask()
         src, dst, names = self.compute_correspondences(
-            garment.get_landmarks(), body_keypoints, garment.clothes_type, mask)
+            garment.get_landmarks(), body_keypoints, garment.clothes_type, mask,
+            worn=getattr(garment, "photo_kind", None) == "worn")
         fn = {"affine": self.affine_warp, "perspective": self.perspective_warp,
               "tps": self.tps_warp}[method]
         self.last = {"method": method, "names": names, "src": src, "dst": dst}
@@ -362,15 +422,23 @@ class GarmentWarper:
         return warped, warped_mask
 
     # ------------------------------------------------------------------ blend
-    def blend(self, body_image, warped_garment, garment_mask, body_mask=None, keypoints=None):
+    def blend(self, body_image, warped_garment, garment_mask, body_mask=None, keypoints=None,
+              protect_head=False):
         """Composite the warped garment over the photo.
 
         * soft (feathered) garment edges;
         * broad shading from the photo is carried onto the garment, so it is not flat;
-        * bare arms beside the torso stay in front of the garment (needs keypoints).
+        * bare arms beside the torso stay in front of the garment (needs keypoints);
+        * protect_head: never draw over the head (only use when the keypoints come
+          from a detected face or pose model, so the head position is trustworthy).
         """
         h, w = body_image.shape[:2]
         alpha = garment_mask.astype(np.float32) / 255.0
+        if protect_head and keypoints is not None:
+            head = self._head_box(keypoints, (h, w))
+            if head is not None:
+                x0, y0, x1, y1 = head
+                alpha[y0:y1, x0:x1] = 0.0
         if body_mask is not None and self.clip_margin is not None:
             r = max(1, int(self.clip_margin * h))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
@@ -440,8 +508,28 @@ class GarmentWarper:
         keep[1:] = stats[1:, cv2.CC_STAT_AREA] > 0.002 * h * w
         return keep[lbl].astype(np.float32)
 
+    @staticmethod
+    def _head_box(keypoints, shape):
+        """(x0, y0, x1, y1) of the head: from the top of the image down to the neck."""
+        neck = keypoints.get("neck")
+        sh = [keypoints.get("left_shoulder"), keypoints.get("right_shoulder")]
+        if neck is None or None in sh:
+            return None
+        h, w = shape
+        span = abs(sh[0][0] - sh[1][0])
+        half = 0.3 * span                       # a head is roughly 0.6 shoulder-widths wide
+        x0, x1 = int(max(neck[0] - half, 0)), int(min(neck[0] + half, w))
+        y1 = int(min(neck[1], h))
+        return (x0, 0, x1, y1) if x1 > x0 and y1 > 0 else None
+
     def try_on(self, body_image, segmentation, garment, method=None):
-        """Convenience: warp + blend using BodySegmenter.run() output."""
+        """Convenience: warp + blend using BodySegmenter.run() output.
+
+        Raises ValueError when the body keypoints can't be right (see
+        check_body_proportions) instead of shrinking the garment onto the face.
+        """
+        check_body_proportions(segmentation)
         warped, mask = self.warp(garment, segmentation["keypoints"], body_image.shape, method)
+        trusted = segmentation.get("keypoint_source") in ("face+mask", "openpose")
         return self.blend(body_image, warped, mask, segmentation.get("body_mask"),
-                          segmentation.get("keypoints"))
+                          segmentation.get("keypoints"), protect_head=trusted)
