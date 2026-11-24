@@ -1,25 +1,14 @@
 """Step 1: detect and segment the body region of the uploaded image with OpenCV.
 
-Output of BodySegmenter.run(image) -- this is the contract the warper relies on:
-
-    {
-        "bbox":            (x, y, w, h) of the person, in original image pixels
-        "body_mask":       uint8 HxW, 255 = person, 0 = background
-        "torso_mask":      uint8 HxW, 255 = torso (shoulders down to hips)
-        "keypoints":       {name: (x, y) or None} in original image pixels; every name
-                           in KEYPOINT_NAMES is present, None = not detected
-        "keypoint_source": "openpose" | "face+mask" | "mask"
-    }
-
-Keypoint left/right is the PERSON's left/right (OpenPose convention), so for a
-person facing the camera "left_shoulder" appears on the right side of the image.
-The shoulders and hips are filled whenever a body is found. The estimated
-fallback ("face+mask" / "mask") only produces head_top, neck, the shoulders and
-the hips; elbows, wrists, knees etc. are None unless OpenPose is installed.
+BodySegmenter.run(image) returns {"bbox", "body_mask", "torso_mask", "keypoints",
+"keypoint_source"}. "keypoints" has every name in KEYPOINT_NAMES, as (x, y) in
+original image pixels or None when not found. Without the OpenPose model only
+head_top, neck, shoulders and hips are estimated, and the shoulders/hips are None
+(with an empty torso_mask) when the estimate fails its sanity checks -- callers
+must handle that instead of assuming they are always present.
 """
 
 import os
-
 import cv2
 import numpy as np
 
@@ -33,15 +22,12 @@ OPENPOSE_COCO_POINTS = {
     14: "right_eye", 15: "left_eye", 16: "right_ear", 17: "left_ear",
 }
 KEYPOINT_NAMES = ["head_top"] + list(OPENPOSE_COCO_POINTS.values())
-
 DEFAULT_POSE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "pose", "coco")
-
 
 class BodySegmenter:
     """Finds the person in an image and produces a body mask and keypoints."""
 
-    def __init__(self, work_height=512, grabcut_iters=5, pose_model_dir=DEFAULT_POSE_DIR,
-                 keypoint_threshold=0.1):
+    def __init__(self, work_height=512, grabcut_iters=5, pose_model_dir=DEFAULT_POSE_DIR, keypoint_threshold=0.1):
         self.work_height = work_height
         self.grabcut_iters = grabcut_iters
         self.keypoint_threshold = keypoint_threshold
@@ -60,9 +46,7 @@ class BodySegmenter:
 
         self.scale = 1.0  # working size / original size, set by preprocess()
         self.face = None  # (x, y, w, h) in working pixels, set by detect_person()
-
-    # ------------------------------------------------------------------ steps
-
+    
     def preprocess(self, image):
         """Convert to 3-channel BGR, resize to the working height and denoise lightly."""
         if image is None:
@@ -79,7 +63,6 @@ class BodySegmenter:
 
     def detect_person(self, image):
         """Return the (x, y, w, h) box of the main person.
-
         Tries the HOG people detector first, then a box grown from a detected
         face, then a centered box (DeepFashion photos are tightly cropped).
         """
@@ -105,6 +88,7 @@ class BodySegmenter:
             return self._clip_box((cx - 2.5 * fw, fy - 0.6 * fh, 5 * fw, 8 * fh), w, h)
 
         return self._clip_box((0.1 * w, 0.02 * h, 0.8 * w, 0.98 * h), w, h)
+
 
     def segment_body(self, image, bounding_box):
         """Separate the person from the background with GrabCut seeded by the box."""
@@ -135,7 +119,7 @@ class BodySegmenter:
 
         body = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
         return self.refine_mask(body)
-
+    
     def refine_mask(self, mask):
         """Clean the mask: remove specks, close gaps, keep the largest blob, fill holes."""
         k = max(3, (mask.shape[0] // 100) | 1)
@@ -152,7 +136,6 @@ class BodySegmenter:
         # Smooth jagged edges.
         refined = cv2.GaussianBlur(refined, (k, k), 0)
         return np.where(refined > 127, 255, 0).astype(np.uint8)
-
     def detect_keypoints(self, image, body_mask=None):
         """Return ({name: (x, y)}, source) in working-image pixels.
 
@@ -170,7 +153,6 @@ class BodySegmenter:
         if body_mask is None:
             return {}, "mask"
         return self._estimate_keypoints(body_mask), ("face+mask" if self.face is not None else "mask")
-
     def segment_torso(self, body_mask, keypoints=None):
         """Return the part of the body mask between the shoulders and the hips."""
         h, w = body_mask.shape
@@ -190,11 +172,8 @@ class BodySegmenter:
             polygon = np.array([top_l, top_r, bot_r, bot_l], np.int32)
             cv2.fillPoly(torso, [polygon], 255)
         else:
-            ys = np.where(body_mask.any(axis=1))[0]
-            if len(ys) == 0:
-                return torso
-            top, height = ys[0], ys[-1] - ys[0]
-            torso[int(top + 0.2 * height):int(top + 0.6 * height), :] = 255
+            # No trustworthy shoulders/hips: leave the torso empty rather than guess.
+            return torso
 
         return cv2.bitwise_and(torso, body_mask)
 
@@ -216,9 +195,6 @@ class BodySegmenter:
                           if k in keypoints else None for k in KEYPOINT_NAMES},
             "keypoint_source": source,
         }
-
-    # ---------------------------------------------------------------- helpers
-
     @staticmethod
     def _clip_box(box, w, h):
         x, y, bw, bh = box
@@ -264,12 +240,17 @@ class BodySegmenter:
         return points
 
     def _estimate_keypoints(self, body_mask):
-        """Rough torso keypoints from body proportions (head height as the unit)."""
+        """Rough torso keypoints from body proportions (head height as the unit).
+
+        Returns only what it can trust: when there is no face and the outline has
+        no clear neck, or the result fails _torso_is_plausible(), the neck,
+        shoulders and hips are left out (so they come back as None) rather than
+        guessed. head_top is the top of the outline.
+        """
         ys, xs = np.where(body_mask > 0)
         if len(ys) == 0:
             return {}
         top, bottom = ys.min(), ys.max()
-        h = body_mask.shape[0]
 
         if self.face is not None:
             fx, fy, fw, fh = self.face
@@ -277,35 +258,85 @@ class BodySegmenter:
             head_h = fh * 1.25
             chin_y = fy + fh
         else:
-            # Find the neck as the narrowest row in the upper part of the mask.
             cx = float(np.median(xs[ys < top + 0.3 * (bottom - top)]))
-            widths = (body_mask > 0).sum(axis=1).astype(np.float32)
-            lo, hi = int(top + 0.05 * (bottom - top)), int(top + 0.3 * (bottom - top))
-            if hi - lo < 3:
-                return {}
-            neck_row = lo + int(np.argmin(widths[lo:hi] + (widths[lo:hi] == 0) * 1e9))
+            neck_row = self._find_neck_row(body_mask, top, bottom)
+            if neck_row is None:
+                return {"head_top": (cx, float(top))}
             head_h = max(neck_row - top, 1) * 1.05
             chin_y = neck_row
+        points = {"head_top": (cx, float(top))}
 
         neck_y = chin_y + 0.25 * head_h
         shoulder_y = chin_y + 0.5 * head_h
         hip_y = min(shoulder_y + 2.1 * head_h, bottom)
         max_half = 1.0 * head_h  # shoulders are ~2 head heights wide; stops arms widening them
 
-        points = {"head_top": (cx, float(top)), "neck": (cx, neck_y)}
+        torso = {"neck": (cx, neck_y)}
         ext = self._row_extent(body_mask, shoulder_y, cx)
         if ext:
             half = min(max(cx - ext[0], ext[1] - cx), max_half)
             # Image-left is the person's right.
-            points["right_shoulder"] = (cx - half, shoulder_y)
-            points["left_shoulder"] = (cx + half, shoulder_y)
-        if hip_y < h:
-            ext = self._row_extent(body_mask, hip_y, cx)
-            if ext:
-                half = min(max(cx - ext[0], ext[1] - cx), 0.8 * max_half)
-                points["right_hip"] = (cx - half, hip_y)
-                points["left_hip"] = (cx + half, hip_y)
+            torso["right_shoulder"] = (cx - half, shoulder_y)
+            torso["left_shoulder"] = (cx + half, shoulder_y)
+        ext = self._row_extent(body_mask, hip_y, cx)
+        if ext:
+            half = min(max(cx - ext[0], ext[1] - cx), 0.8 * max_half)
+            torso["right_hip"] = (cx - half, hip_y)
+            torso["left_hip"] = (cx + half, hip_y)
+
+        if self._torso_is_plausible(torso, body_mask):
+            points.update(torso)
         return points
+
+    @staticmethod
+    def _find_neck_row(body_mask, top, bottom):
+        """Row of a real neck in the outline: clearly narrower than the head above
+        and the shoulders below. None when there is no such narrowing (e.g. long
+        hair over the neck, or a head cropped by the frame)."""
+        widths = (body_mask > 0).sum(axis=1).astype(np.float32)
+        lo, hi = int(top + 0.05 * (bottom - top)), int(top + 0.3 * (bottom - top))
+        if hi - lo < 3:
+            return None
+        window = widths[lo:hi] + (widths[lo:hi] == 0) * 1e9
+        i = int(np.argmin(window))
+        if i == 0 or i == len(window) - 1:
+            return None  # the narrowest row is just the window edge, not a neck
+        neck_row, neck_w = lo + i, float(widths[lo + i])
+        head_w = float(widths[top:neck_row].max())
+        below = widths[neck_row:min(neck_row + max(neck_row - top, 3), bottom + 1)]
+        shoulder_w = float(below.max()) if len(below) else 0.0
+        if head_w < 1.2 * neck_w or shoulder_w < 1.6 * neck_w:
+            return None
+        return neck_row
+
+    @staticmethod
+    def _torso_is_plausible(points, body_mask):
+        """Sanity check for estimated shoulders/hips against the body outline.
+
+        * the shoulders must sit well below the top of the outline;
+        * the shoulder span must be a reasonable fraction of the outline's width
+          below them (the median row width, so arms or a wide skirt don't dominate);
+        * the hips must be below the shoulders.
+        """
+        needed = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+        if any(k not in points for k in needed):
+            return False
+        ys = np.where(body_mask.any(axis=1))[0]
+        top, bottom = ys[0], ys[-1]
+        height = max(bottom - top, 1)
+        shoulder_y = (points["left_shoulder"][1] + points["right_shoulder"][1]) / 2
+        hip_y = (points["left_hip"][1] + points["right_hip"][1]) / 2
+        span = abs(points["left_shoulder"][0] - points["right_shoulder"][0])
+
+        if shoulder_y - top < 0.12 * height:
+            return False
+        if hip_y - shoulder_y < 0.5 * span:
+            return False
+        widths = (body_mask[int(shoulder_y):bottom + 1] > 0).sum(axis=1)
+        widths = widths[widths > 0]
+        if len(widths) == 0 or span < 0.4 * float(np.median(widths)):
+            return False
+        return True
 
 
 def draw_debug(image, result):
@@ -327,3 +358,7 @@ def draw_debug(image, result):
     cv2.putText(out, "keypoints: " + result["keypoint_source"], (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
+
+    
+
+
