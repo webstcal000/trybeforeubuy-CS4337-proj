@@ -1,6 +1,25 @@
-"""Step 1: detect and segment the body region of the uploaded image with OpenCV."""
+"""Step 1: detect and segment the body region of the uploaded image with OpenCV.
+
+Output of BodySegmenter.run(image) -- this is the contract the warper relies on:
+
+    {
+        "bbox":            (x, y, w, h) of the person, in original image pixels
+        "body_mask":       uint8 HxW, 255 = person, 0 = background
+        "torso_mask":      uint8 HxW, 255 = torso (shoulders down to hips)
+        "keypoints":       {name: (x, y) or None} in original image pixels; every name
+                           in KEYPOINT_NAMES is present, None = not detected
+        "keypoint_source": "openpose" | "face+mask" | "mask"
+    }
+
+Keypoint left/right is the PERSON's left/right (OpenPose convention), so for a
+person facing the camera "left_shoulder" appears on the right side of the image.
+The shoulders and hips are filled whenever a body is found. The estimated
+fallback ("face+mask" / "mask") only produces head_top, neck, the shoulders and
+the hips; elbows, wrists, knees etc. are None unless OpenPose is installed.
+"""
 
 import os
+
 import cv2
 import numpy as np
 
@@ -14,12 +33,15 @@ OPENPOSE_COCO_POINTS = {
     14: "right_eye", 15: "left_eye", 16: "right_ear", 17: "left_ear",
 }
 KEYPOINT_NAMES = ["head_top"] + list(OPENPOSE_COCO_POINTS.values())
+
 DEFAULT_POSE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "pose", "coco")
+
 
 class BodySegmenter:
     """Finds the person in an image and produces a body mask and keypoints."""
 
-    def __init__(self, work_height=512, grabcut_iters=5, pose_model_dir=DEFAULT_POSE_DIR, keypoint_threshold=0.1):
+    def __init__(self, work_height=512, grabcut_iters=5, pose_model_dir=DEFAULT_POSE_DIR,
+                 keypoint_threshold=0.1):
         self.work_height = work_height
         self.grabcut_iters = grabcut_iters
         self.keypoint_threshold = keypoint_threshold
@@ -38,7 +60,9 @@ class BodySegmenter:
 
         self.scale = 1.0  # working size / original size, set by preprocess()
         self.face = None  # (x, y, w, h) in working pixels, set by detect_person()
-    
+
+    # ------------------------------------------------------------------ steps
+
     def preprocess(self, image):
         """Convert to 3-channel BGR, resize to the working height and denoise lightly."""
         if image is None:
@@ -55,6 +79,7 @@ class BodySegmenter:
 
     def detect_person(self, image):
         """Return the (x, y, w, h) box of the main person.
+
         Tries the HOG people detector first, then a box grown from a detected
         face, then a centered box (DeepFashion photos are tightly cropped).
         """
@@ -80,7 +105,6 @@ class BodySegmenter:
             return self._clip_box((cx - 2.5 * fw, fy - 0.6 * fh, 5 * fw, 8 * fh), w, h)
 
         return self._clip_box((0.1 * w, 0.02 * h, 0.8 * w, 0.98 * h), w, h)
-
 
     def segment_body(self, image, bounding_box):
         """Separate the person from the background with GrabCut seeded by the box."""
@@ -111,7 +135,7 @@ class BodySegmenter:
 
         body = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
         return self.refine_mask(body)
-    
+
     def refine_mask(self, mask):
         """Clean the mask: remove specks, close gaps, keep the largest blob, fill holes."""
         k = max(3, (mask.shape[0] // 100) | 1)
@@ -128,6 +152,7 @@ class BodySegmenter:
         # Smooth jagged edges.
         refined = cv2.GaussianBlur(refined, (k, k), 0)
         return np.where(refined > 127, 255, 0).astype(np.uint8)
+
     def detect_keypoints(self, image, body_mask=None):
         """Return ({name: (x, y)}, source) in working-image pixels.
 
@@ -145,6 +170,7 @@ class BodySegmenter:
         if body_mask is None:
             return {}, "mask"
         return self._estimate_keypoints(body_mask), ("face+mask" if self.face is not None else "mask")
+
     def segment_torso(self, body_mask, keypoints=None):
         """Return the part of the body mask between the shoulders and the hips."""
         h, w = body_mask.shape
@@ -190,6 +216,9 @@ class BodySegmenter:
                           if k in keypoints else None for k in KEYPOINT_NAMES},
             "keypoint_source": source,
         }
+
+    # ---------------------------------------------------------------- helpers
+
     @staticmethod
     def _clip_box(box, w, h):
         x, y, bw, bh = box
@@ -298,7 +327,3 @@ def draw_debug(image, result):
     cv2.putText(out, "keypoints: " + result["keypoint_source"], (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
-
-    
-
-
